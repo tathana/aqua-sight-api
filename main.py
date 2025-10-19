@@ -617,10 +617,19 @@ def root():
 @app.get("/health-ee")
 def health_ee():
     try:
-        ee.Initialize()
-        return {"ok": True, "val": ee.Number(1).getInfo()}
+        # ทดสอบเรียก API โดยไม่ re-initialize ซ้ำ
+        # ถ้า init ตอนบูตผ่านแล้ว อันนี้ควรทำงาน
+        return {"ok": True, "roots": ee.data.getAssetRoots()}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        # โชว์ว่ากำลังใช้ env อะไรบ้าง จะช่วยไล่ปัญหาได้เร็ว
+        return {
+            "ok": False,
+            "error": str(e),
+            "has_EE_SERVICE_ACCOUNT": bool(os.getenv("EE_SERVICE_ACCOUNT")),
+            "has_EE_KEY_B64": bool(os.getenv("EE_KEY_B64")),
+            "has_GOOGLE_APPLICATION_CREDENTIALS_JSON": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")),
+        }
+
 
 
 if __name__ == "__main__":
