@@ -1,6 +1,6 @@
 # main.py — Aqua Sight API (TSI reclass + per-scene series + full atmospheric correction)
 
-import os, base64
+import os, json, base64 , tempfile
 from typing import Dict, List, Literal, Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,31 +8,37 @@ from pydantic import BaseModel
 import ee
 
 # ---------- 0) Earth Engine Init ----------
-
-
-# โหมด ENV base64 (เหมาะกับ Render/Railway)
-SA_EMAIL = os.getenv("EE_SERVICE_ACCOUNT")  # เช่น my-sa@my-proj.iam.gserviceaccount.com
-KEY_B64  = os.getenv("EE_KEY_B64")          # key JSON ทั้งไฟล์ในรูป base64
-KEY_TMP  = "/tmp/ee_key.json"
-
-# โหมดไฟล์ (ใช้เฉพาะตอนรันเองบนเครื่อง/VM)
-KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+SA_EMAIL  = os.getenv("EE_SERVICE_ACCOUNT")         # เช่น xxx@project.iam.gserviceaccount.com
+KEY_B64   = os.getenv("EE_KEY_B64")                 # คีย์ทั้งไฟล์ (base64)
+KEY_PATH  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")  # path ไฟล์คีย์ (.json)
 
 try:
-    if KEY_B64 and SA_EMAIL:
-        with open(KEY_TMP, "w") as f:
-            f.write(base64.b64decode(KEY_B64).decode("utf-8"))
-        creds = ee.ServiceAccountCredentials(SA_EMAIL, KEY_TMP)
+    if cred_json:
+        # วิธีที่ง่ายและพลาดยากสุด: วาง JSON ทั้งไฟล์ลง env เดียว
+        info  = json.loads(cred_json)
+        creds = ee.ServiceAccountCredentials(info["client_email"], key_data=cred_json)
         ee.Initialize(creds)
-    elif KEY_PATH and SA_EMAIL:
+    elif SA_EMAIL and KEY_B64:
+        # ทางเลือก: อีเมล + คีย์ base64
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tmp.write(base64.b64decode(KEY_B64))
+        tmp.flush()
+        creds = ee.ServiceAccountCredentials(SA_EMAIL, tmp.name)
+        ee.Initialize(creds)
+    elif SA_EMAIL and KEY_PATH:
+        # ทางเลือก: อีเมล + path ไฟล์คีย์
         creds = ee.ServiceAccountCredentials(SA_EMAIL, KEY_PATH)
         ee.Initialize(creds)
     else:
-        # เผื่อไว้กรณีคุณเคย auth EE ค้างไว้ในเครื่องนักพัฒนา
-        ee.Initialize()
+        # ไม่มี credential ที่ใช้ได้ -> แจ้งเตือนให้ตั้งค่า env
+        raise RuntimeError(
+            "Missing Earth Engine credentials. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS_JSON (recommended) "
+            "หรือ EE_SERVICE_ACCOUNT + EE_KEY_B64 / GOOGLE_APPLICATION_CREDENTIALS."
+        )
 except Exception as e:
     raise RuntimeError(f"Earth Engine init failed: {e}")
-
 app = FastAPI(title="Aqua Sight API", version="1.2.0")
 
 # CORS: ตั้งได้หลายโดเมนด้วยจุลภาค
