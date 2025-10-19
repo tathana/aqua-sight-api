@@ -1,0 +1,6 @@
+fastapi~=0.119.0
+pydantic~=2.12.3
+uvicorn[standard]~=0.30
+earthengine-api~=1.6.12
+google-auth~=2.34
+python-dotenv~=1.0
