@@ -35,13 +35,18 @@ except Exception as e:
 
 app = FastAPI(title="Aqua Sight API", version="1.2.0")
 
+# CORS: ตั้งได้หลายโดเมนด้วยจุลภาค
+allowed = os.getenv("ALLOWED_ORIGIN", "*")
+origins = [o.strip() for o in allowed.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://your-n8n-domain.example"],  # เปลี่ยนเป็นของจริง
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
 
 # ---------- 1) AOIs ----------
 def poly(coords): return ee.Geometry.Polygon(coords)
