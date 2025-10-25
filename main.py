@@ -1,4 +1,4 @@
-# main.py — Aqua Sight API (fixed monthly_series KeyError + agg support)
+# main.py — Aqua Sight API (monthly agg + min_images + safe parsing)
 
 import os, json, base64, tempfile
 from typing import Dict, List, Literal, Any, Optional
@@ -9,13 +9,13 @@ import ee
 
 # ---------- 0) Earth Engine Init ----------
 cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-SA_EMAIL = os.getenv("EE_SERVICE_ACCOUNT")
-KEY_B64 = os.getenv("EE_KEY_B64")
-KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+SA_EMAIL  = os.getenv("EE_SERVICE_ACCOUNT")
+KEY_B64   = os.getenv("EE_KEY_B64")
+KEY_PATH  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 try:
     if cred_json:
-        info = json.loads(cred_json)
+        info  = json.loads(cred_json)
         creds = ee.ServiceAccountCredentials(info["client_email"], key_data=cred_json)
         ee.Initialize(creds)
     elif SA_EMAIL and KEY_B64:
@@ -32,11 +32,11 @@ try:
 except Exception as e:
     raise RuntimeError(f"Earth Engine init failed: {e}")
 
-app = FastAPI(title="Aqua Sight API", version="1.2.1")
+app = FastAPI(title="Aqua Sight API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGIN", "*").split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -48,19 +48,32 @@ def poly(coords): return ee.Geometry.Polygon(coords)
 AOIS = {
     "CP01": poly([[99.24686562565613,10.445791568889858],[99.24744498280334,10.445707160671937],[99.24735915211487,10.442373017728443],[99.24484860447693,10.439418683974635],[99.2461575224762,10.439671913681973],[99.24770247486877,10.442330813158181],[99.24804579762268,10.445749364783767],[99.24873244313049,10.445960385256942],[99.24843203572082,10.448070582107523],[99.24692999867248,10.448049480209948],[99.24686562565613,10.445791568889858]]),
     "LS01": poly([[99.15535572624208,9.94453648425491],[99.14522770500184,9.94033053669308],[99.14578560447694,9.939971232131072],[99.15164354896547,9.940985738113076],[99.15320995903016,9.94231727243655],[99.15604237174989,9.94314155287098],[99.15535572624208,9.94453648425491]]),
+    "LS03": poly([[99.06211096162414,9.953918743528815],[99.06337696427917,9.953411511011419],[99.06495410317993,9.953062788198586],[99.06823712701416,9.95331640482666],[99.0680654656372,9.953622857989421],[99.06404215211487,9.953665127368613],[99.06225043649292,9.954278032751825],[99.06211096162414,9.953918743528815]]),
+    "TP01": poly([[99.37406626983643,9.189275494872142],[99.3680795793152,9.185886312564055],[99.37121239944459,9.184001065872005],[99.3819841508484,9.191160713494348],[99.37844363494874,9.193744929453619],[99.37406626983643,9.189275494872142]]),
+    "TP04": poly([[99.17458631484986,9.088432491599194],[99.16994072883607,9.08680098982789],[99.16754819839478,9.08496819001516],[99.16601397483826,9.082510316590984],[99.16745163887025,9.082171298244077],[99.17001583068848,9.08557206150935],[99.1720006653595,9.086705642091964],[99.17572357147218,9.08743664075224],[99.17458631484986,9.088432491599194]]),
+    "TP11": poly([[99.60781251982117,8.532800202326145],[99.61010849073791,8.53450842130176],[99.61061274603271,8.535802843013302],[99.61061274603271,8.536333342446767],[99.60976516798401,8.534837332152573],[99.6075657565918,8.53357473734279],[99.60781251982117,8.532800202326145]]),
+    "PN01": poly([[99.90849795568084,7.891517643958013],[99.91079392659759,7.89343054126273],[99.91115870702362,7.894333850801101],[99.90807953107452,7.8920490052084915],[99.90849795568084,7.891517643958013]]),
+    "SK01": poly([[100.12514956733038,7.789004657536354],[100.12512878021052,7.788904338311305],[100.12580737909128,7.788852517775042],[100.12580939074805,7.788863147629168],[100.1251522495394,7.7889202830904],[100.1251710250025,7.7890053219020015],[100.12514956733038,7.789004657536354]]),
+    "SK06": poly([[100.15771078416547,7.625133904695956],[100.15905188867292,7.62493717628797],[100.15962051698408,7.624458647350537],[100.15961515256605,7.625564580084231],[100.15859591314039,7.625330633013513],[100.15675055333814,7.625803844001549],[100.15771078416547,7.625133904695956]])
+}
+STATIONS_META = {
+    "CP01":"CP01 Chumphon River","LS01":"LS01 Lower Lang Suan River","LS03":"LS03 Upper Lang Suan River",
+    "TP01":"TP01 Lower Tapee River","TP04":"TP04 Phum Duang River","TP11":"TP011 Upper Tapee River",
+    "PN01":"PN01 Pak Phanang River","SK01":"SK01 Thale Noi","SK06":"SK06 Thalaluang"
 }
 YEARS = list(range(2017, 2026))
 
-# ---------- 2) Helpers ----------
+# ---------- 2) Time windows & base helpers ----------
 def get_window(year:int):
     ini = ee.Date.fromYMD(year,1,1); end = ini.advance(12,"month")
     return ini, end
 
 def build_water_mask(geom: ee.Geometry) -> ee.Image:
-    col = (ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-           .filterBounds(geom)
-           .filter(ee.Filter.lt('CLOUD_COVER',30))
-           .select('SR_B6'))
+    SRP = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2").select('SR_B6')
+    col = (SRP.filterBounds(geom)
+             .filter(ee.Filter.lt('CLOUD_COVER',30))
+             .filter(ee.Filter.calendarRange(1,1,'month'))
+             .filter(ee.Filter.calendarRange(2021,2025,'year')))
     m = ee.Image(col.median().lt(300))
     return m.updateMask(m)
 
@@ -104,63 +117,140 @@ def tsi_reclass(tsi_img: ee.Image) -> ee.Image:
 SCALE = 20
 MAXPX = 1e13
 
-def monthly_series(ic, geom, band, year):
-    out = []
-    for m in range(1, 13):
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None: return None
+        return float(x)
+    except Exception:
+        return None
+
+def monthly_series(
+    ic: ee.ImageCollection,
+    geom: ee.Geometry,
+    band: str,
+    year: int,
+    agg: Literal["mean","median","scene"]="mean",
+    min_images: int = 1
+) -> List[Dict[str, Any]]:
+    """
+    agg = mean|median  -> รวมภาพทั้งเดือนแล้ว reduceRegion
+    agg = scene        -> คิดค่าของแต่ละ scene แล้วเอาค่าเฉลี่ยของ scene ภายในเดือน
+    min_images        -> น้อยกว่านี้ให้คืน None
+    """
+    out: List[Dict[str, Any]] = []
+    for m in range(1, 12+1):
         start = ee.Date.fromYMD(year, m, 1)
-        end = start.advance(1, "month")
+        end   = start.advance(1, "month")
         month_ic = ic.filterDate(start, end)
 
-        def per_img(img):
+        # ตรวจจำนวนภาพ (ปลายทางจะใช้ getInfo แค่ตัวเลขเดียวต่อเดือน)
+        count = int(ee.Number(month_ic.size()).getInfo())
+        if count < min_images:
+            out.append({"month": m, "value": None})
+            continue
+
+        if agg in ("mean","median"):
+            img = month_ic.mean() if agg == "mean" else month_ic.median()
             val = img.select(band).reduceRegion(
                 ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX
             ).get(band)
-            return ee.Feature(None, {"v": val})
+            out.append({"month": m, "value": _safe_float(ee.Number(val).getInfo() if val is not None else None)})
+        else:
+            # agg = 'scene' : คิดค่าต่อภาพก่อน แล้วค่อยเฉลี่ยใน Python
+            def per_img(image):
+                v = image.select(band).reduceRegion(
+                    ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX
+                ).get(band)
+                # คืน property ชื่อ 'v' เสมอ
+                return ee.Feature(None, {"v": v})
 
-        feats = ee.FeatureCollection(month_ic.map(per_img)).getInfo().get("features", [])
-        vals = []
-        for f in feats:
-            props = f.get("properties") or {}
-            if "v" in props and props["v"] is not None:
-                try:
-                    vals.append(float(props["v"]))
-                except Exception:
-                    pass
+            feats = ee.FeatureCollection(month_ic.map(per_img)).getInfo().get("features", [])
+            vals: List[float] = []
+            for f in feats:
+                props = f.get("properties") or {}
+                v = props.get("v")  # อย่า index ตรง ๆ เพื่อกัน KeyError
+                fv = _safe_float(v)
+                if fv is not None:
+                    vals.append(fv)
 
-        vpy = (sum(vals) / len(vals)) if len(vals) else None
-        out.append({"month": m, "value": vpy})
+            out.append({"month": m, "value": (sum(vals)/len(vals) if len(vals) else None)})
     return out
 
-def scenes_series(ic, geom, band):
+def scenes_series(ic: ee.ImageCollection, geom: ee.Geometry, band: str) -> List[Dict[str, Any]]:
     def per_image(img):
-        val = img.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX).get(band)
-        return ee.Feature(None, {"date": ee.Date(img.get('system:time_start')).format("YYYY-MM-dd"), "value": val})
+        v = img.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX).get(band)
+        return ee.Feature(None, {
+            "date": ee.Date(img.get('system:time_start')).format("YYYY-MM-dd"),
+            "value": v
+        })
     fc = ee.FeatureCollection(ic.map(per_image)).getInfo().get("features", [])
-    out = []
+    out: List[Dict[str, Any]] = []
     for f in fc:
-        props = f.get("properties") or {}
-        if "date" in props:
-            val = props.get("value")
-            out.append({"date": props["date"], "value": (float(val) if val is not None else None)})
+        p = f.get("properties") or {}
+        d = p.get("date")
+        v = _safe_float(p.get("value"))
+        if d is not None:
+            out.append({"date": d, "value": v})
     out.sort(key=lambda x: x["date"])
     return out
 
-# ---------- 5) Endpoints ----------
-@app.get("/timeseries_monthly")
+# ---------- 5) Schemas ----------
+class MonthlyPoint(BaseModel):
+    month: int
+    value: Optional[float] = None
+
+class ScenePoint(BaseModel):
+    date: str
+    value: Optional[float] = None
+
+class TSMonthlyResponse(BaseModel):
+    station: str
+    year: int
+    cloud_perc: int
+    ac: Literal["none","full"]
+    agg: Literal["mean","median","scene"]
+    min_images: int
+    monthly: Dict[str, List[MonthlyPoint]]
+
+class TSScenesResponse(BaseModel):
+    station: str
+    year: int
+    cloud_perc: int
+    ac: Literal["none","full"]
+    series: Dict[str, List[ScenePoint]]
+
+# ---------- 6) Build collections ----------
+def build_collections(geom, ini, end, cloud_perc, mask):
+    sr_scaled = s2_sr(geom, ini, end, cloud_perc).map(lambda im: add_scaled(im, mask))
+    return sr_scaled
+
+# ---------- 7) Endpoints ----------
+@app.get("/stations")
+def stations():
+    return [{"code": k, "name": STATIONS_META[k]} for k in AOIS.keys()]
+
+@app.get("/years")
+def years():
+    return YEARS
+
+@app.get("/timeseries_monthly", response_model=TSMonthlyResponse)
 def timeseries_monthly(
-    station: Literal["CP01","LS01"],
+    station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
     year: int = Query(..., ge=2017, le=2025),
-    ac: Literal["none","full"] = "none"
+    cloud_perc: int = Query(30, ge=0, le=100),
+    ac: Literal["none","full"] = "none",
+    agg: Literal["mean","median","scene"] = "mean",
+    min_images: int = Query(1, ge=1, le=50)
 ):
     if station not in AOIS: raise HTTPException(404, "Unknown station")
-    geom = AOIS[station]
-    ini, end = get_window(year)
+    geom = AOIS[station]; ini, end = get_window(year)
     mask = build_water_mask(geom)
-    col = s2_sr(geom, ini, end).map(lambda im: add_scaled(im, mask))
+    col  = build_collections(geom, ini, end, cloud_perc, mask)
 
-    ph_ic = col.map(img_pH)
+    # สร้างคอลเลกชันตัวชี้วัด
+    ph_ic  = col.map(img_pH)
     tur_ic = col.map(img_turb)
-    do_ic = col.map(img_do)
+    do_ic  = col.map(img_do)
     chl_ic = col.map(img_chl)
     zsd_ic = col.map(img_zsd)
     tsi_ic = chl_ic.map(img_tsi_from_chl)
@@ -168,19 +258,61 @@ def timeseries_monthly(
     sal_ic = col.map(img_sal)
 
     return {
-        "station": station,
-        "year": year,
+        "station": station, "year": year, "cloud_perc": cloud_perc, "ac": ac,
+        "agg": agg, "min_images": min_images,
         "monthly": {
-            "pH": monthly_series(ph_ic, geom, "pH", year),
-            "turbidity": monthly_series(tur_ic, geom, "turbidity", year),
-            "salinity_idx": monthly_series(sal_ic, geom, "salinity_idx", year),
-            "do_mgL": monthly_series(do_ic, geom, "do_mgL", year),
-            "chl_a": monthly_series(chl_ic, geom, "chl_a", year),
-            "secchi_m": monthly_series(zsd_ic, geom, "secchi_m", year),
-            "tsi": monthly_series(tsi_ic, geom, "tsi", year),
-            "tsi_class": monthly_series(tsi_cls_ic, geom, "tsi_class", year)
+            "pH":           monthly_series(ph_ic,  geom, "pH",        year, agg, min_images),
+            "turbidity":    monthly_series(tur_ic, geom, "turbidity", year, agg, min_images),
+            "salinity_idx": monthly_series(sal_ic, geom, "salinity_idx", year, agg, min_images),
+            "do_mgL":       monthly_series(do_ic,  geom, "do_mgL",    year, agg, min_images),
+            "chl_a":        monthly_series(chl_ic, geom, "chl_a",     year, agg, min_images),
+            "secchi_m":     monthly_series(zsd_ic, geom, "secchi_m",  year, agg, min_images),
+            "tsi":          monthly_series(tsi_ic, geom, "tsi",       year, agg, min_images),
+            "tsi_class":    monthly_series(tsi_cls_ic, geom, "tsi_class", year, agg, min_images)
         }
     }
+
+@app.get("/timeseries_scenes", response_model=TSScenesResponse)
+def timeseries_scenes(
+    station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
+    year: int = Query(..., ge=2017, le=2025),
+    cloud_perc: int = Query(30, ge=0, le=100),
+    ac: Literal["none","full"] = "none"
+):
+    if station not in AOIS: raise HTTPException(404, "Unknown station")
+    geom = AOIS[station]; ini, end = get_window(year)
+    mask = build_water_mask(geom)
+    col  = build_collections(geom, ini, end, cloud_perc, mask)
+
+    ph_ic  = col.map(img_pH)
+    tur_ic = col.map(img_turb)
+    do_ic  = col.map(img_do)
+    chl_ic = col.map(img_chl)
+    zsd_ic = col.map(img_zsd)
+    tsi_ic = chl_ic.map(img_tsi_from_chl)
+    tsi_cls_ic = tsi_ic.map(tsi_reclass)
+    sal_ic = col.map(img_sal)
+
+    return {
+        "station": station, "year": year, "cloud_perc": cloud_perc, "ac": ac,
+        "series": {
+            "pH":           scenes_series(ph_ic,  geom, "pH"),
+            "turbidity":    scenes_series(tur_ic, geom, "turbidity"),
+            "salinity_idx": scenes_series(sal_ic, geom, "salinity_idx"),
+            "do_mgL":       scenes_series(do_ic,  geom, "do_mgL"),
+            "chl_a":        scenes_series(chl_ic, geom, "chl_a"),
+            "secchi_m":     scenes_series(zsd_ic, geom, "secchi_m"),
+            "tsi":          scenes_series(tsi_ic, geom, "tsi"),
+            "tsi_class":    scenes_series(tsi_cls_ic, geom, "tsi_class")
+        }
+    }
+
+@app.get("/")
+def root():
+    return {"name":"Aqua Sight API",
+            "examples":{
+                "monthly":"/timeseries_monthly?station=CP01&year=2024&agg=scene&min_images=1",
+                "scenes":"/timeseries_scenes?station=CP01&year=2024"}}
 
 @app.get("/health-ee")
 def health_ee():
@@ -188,13 +320,6 @@ def health_ee():
         return {"ok": True, "roots": ee.data.getAssetRoots()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
-@app.get("/")
-def root():
-    return {"name": "Aqua Sight API",
-            "examples": {
-                "monthly": "/timeseries_monthly?station=CP01&year=2024"
-            }}
 
 if __name__ == "__main__":
     import uvicorn
