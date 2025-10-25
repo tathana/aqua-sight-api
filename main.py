@@ -1,6 +1,6 @@
-# main.py — Aqua Sight API (TSI reclass + per-scene series + full atmospheric correction)
+# main.py — Aqua Sight API (masked values + monthly agg options + metadata)
 
-import os, json, base64 , tempfile
+import os, json, base64, tempfile
 from typing import Dict, List, Literal, Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,42 +9,37 @@ import ee
 
 # ---------- 0) Earth Engine Init ----------
 cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-SA_EMAIL  = os.getenv("EE_SERVICE_ACCOUNT")         # เช่น xxx@project.iam.gserviceaccount.com
-KEY_B64   = os.getenv("EE_KEY_B64")                 # คีย์ทั้งไฟล์ (base64)
-KEY_PATH  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")  # path ไฟล์คีย์ (.json)
+SA_EMAIL  = os.getenv("EE_SERVICE_ACCOUNT")
+KEY_B64   = os.getenv("EE_KEY_B64")
+KEY_PATH  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 try:
     if cred_json:
-        # วิธีที่ง่ายและพลาดยากสุด: วาง JSON ทั้งไฟล์ลง env เดียว
         info  = json.loads(cred_json)
         creds = ee.ServiceAccountCredentials(info["client_email"], key_data=cred_json)
         ee.Initialize(creds)
     elif SA_EMAIL and KEY_B64:
-        # ทางเลือก: อีเมล + คีย์ base64
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-        tmp.write(base64.b64decode(KEY_B64))
-        tmp.flush()
+        tmp.write(base64.b64decode(KEY_B64)); tmp.flush()
         creds = ee.ServiceAccountCredentials(SA_EMAIL, tmp.name)
         ee.Initialize(creds)
     elif SA_EMAIL and KEY_PATH:
-        # ทางเลือก: อีเมล + path ไฟล์คีย์
         creds = ee.ServiceAccountCredentials(SA_EMAIL, KEY_PATH)
         ee.Initialize(creds)
     else:
-        # ไม่มี credential ที่ใช้ได้ -> แจ้งเตือนให้ตั้งค่า env
         raise RuntimeError(
             "Missing Earth Engine credentials. "
             "Set GOOGLE_APPLICATION_CREDENTIALS_JSON (recommended) "
-            "หรือ EE_SERVICE_ACCOUNT + EE_KEY_B64 / GOOGLE_APPLICATION_CREDENTIALS."
+            "or EE_SERVICE_ACCOUNT + (EE_KEY_B64 / GOOGLE_APPLICATION_CREDENTIALS)."
         )
 except Exception as e:
     raise RuntimeError(f"Earth Engine init failed: {e}")
-app = FastAPI(title="Aqua Sight API", version="1.2.0")
 
-# CORS: ตั้งได้หลายโดเมนด้วยจุลภาค
+app = FastAPI(title="Aqua Sight API", version="1.3.0")
+
+# ---------- CORS ----------
 allowed = os.getenv("ALLOWED_ORIGIN", "*")
 origins = [o.strip() for o in allowed.split(",") if o.strip()]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -52,7 +47,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
 
 # ---------- 1) AOIs ----------
 def poly(coords): return ee.Geometry.Polygon(coords)
@@ -75,13 +69,12 @@ STATIONS_META = {
 }
 YEARS = list(range(2017, 2026))
 
-# ---------- 2) Time windows & base helpers ----------
+# ---------- 2) Windows & helpers ----------
 def get_window(year:int):
     ini = ee.Date.fromYMD(year,1,1); end = ini.advance(12,"month")
     return ini, end
 
 def build_water_mask(geom: ee.Geometry) -> ee.Image:
-    # Landsat-9 SR (ม.ค. 2021–2025), CLOUD_COVER < 30, SR_B6 < 300
     SRP = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
     def apply_scale(img):
         optical = img.select('SR_B.*').multiply(0.0000275).add(-0.2)
@@ -110,53 +103,40 @@ def add_scaled(img: ee.Image, mask: ee.Image) -> ee.Image:
     return (img.select(bands).divide(10000).multiply(mask)
             .copyProperties(img, ['system:time_start']))
 
-# ---------- 3) Atmospheric correction (full) ----------
+# ---------- 3) Atmospheric correction ----------
 pi = ee.Image(3.141592)
 ozone = ee.ImageCollection('TOMS/MERGED')
 
 def _s2_correction_common(img: ee.Image, bands: List[str], ini: ee.Date, end: ee.Date, mask: ee.Image):
     rescale = img.select(bands).divide(10000).multiply(mask)
     footprint = rescale.geometry()
-
     DEM = ee.Image('USGS/SRTMGL1_003').clip(footprint)
     DU  = ee.Image(ozone.filterDate(ini,end).filterBounds(footprint).mean())
-
     imgDate = ee.Date(img.get('system:time_start'))
     FOY = ee.Date.fromYMD(imgDate.get('year'),1,1)
     JD  = imgDate.difference(FOY,'day').int().add(1)
-
     myCos = ((ee.Image(0.0172).multiply(ee.Image(JD).subtract(ee.Image(2)))).cos()).pow(2)
     cosd  = myCos.multiply(pi.divide(ee.Image(180))).cos()
     d     = ee.Image(1).subtract(ee.Image(0.01673)).multiply(cosd).clip(footprint)
-
     SunAz = ee.Image.constant(img.get('MEAN_SOLAR_AZIMUTH_ANGLE')).clip(footprint)
     SunZe = ee.Image.constant(img.get('MEAN_SOLAR_ZENITH_ANGLE')).clip(footprint)
     cosdSunZe = SunZe.multiply(pi.divide(ee.Image(180))).cos()
     sindSunZe = SunZe.multiply(pi.divide(ee.Image(180))).sin()
-
     SatZe = ee.Image.constant(img.get('MEAN_INCIDENCE_ZENITH_ANGLE_B5')).clip(footprint)
     cosdSatZe = SatZe.multiply(pi.divide(ee.Image(180))).cos()
     sindSatZe = SatZe.multiply(pi.divide(ee.Image(180))).sin()
-
     SatAz = ee.Image.constant(img.get('MEAN_INCIDENCE_AZIMUTH_ANGLE_B5')).clip(footprint)
     RelAz = SatAz.subtract(SunAz)
     cosdRelAz = RelAz.multiply(pi.divide(ee.Image(180))).cos()
-
     P  = (ee.Image(101325).multiply(ee.Image(1).subtract(ee.Image(0.0000225577).multiply(DEM)).pow(5.25588)).multiply(0.01)).multiply(mask)
     Po = ee.Image(1013.25)
-
-    return {
-        "rescale":rescale, "footprint":footprint, "DU":DU, "d":d,
-        "SunZe":SunZe, "cosdSunZe":cosdSunZe, "sindSunZe":sindSunZe,
-        "SatZe":SatZe, "cosdSatZe":cosdSatZe, "sindSatZe":sindSatZe,
-        "cosdRelAz":cosdRelAz, "P":P, "Po":Po
-    }
+    return {"rescale":rescale,"footprint":footprint,"DU":DU,"d":d,"SunZe":SunZe,
+            "cosdSunZe":cosdSunZe,"sindSunZe":sindSunZe,"SatZe":SatZe,"cosdSatZe":cosdSatZe,
+            "sindSatZe":sindSatZe,"cosdRelAz":cosdRelAz,"P":P,"Po":Po}
 
 def s2_correction_toa(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image) -> ee.Image:
-    # ใช้กับ COPERNICUS/S2 (TOA)
     bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']
     C = _s2_correction_common(img, bands, ini, end, mask)
-
     ESUN = ee.Image(ee.Array([ee.Image(img.get('SOLAR_IRRADIANCE_B1')),
                               ee.Image(img.get('SOLAR_IRRADIANCE_B2')),
                               ee.Image(img.get('SOLAR_IRRADIANCE_B3')),
@@ -170,99 +150,22 @@ def s2_correction_toa(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image)
                               ee.Image(img.get('SOLAR_IRRADIANCE_B12'))])).toArray().toArray(1)
     ESUN = ESUN.multiply(ee.Image(1))
     ESUNImg = ESUN.arrayProject([0]).arrayFlatten([bands])
-
     imgArr = C["rescale"].select(bands).toArray().toArray(1)
     Ltoa = imgArr.multiply(ESUN).multiply(C["cosdSunZe"]).divide(pi.multiply(C["d"].pow(2)))
-
     bandCenter = ee.Image(443).divide(1000).addBands(ee.Image(490).divide(1000)) \
         .addBands(ee.Image(560).divide(1000)).addBands(ee.Image(665).divide(1000)) \
         .addBands(ee.Image(705).divide(1000)).addBands(ee.Image(740).divide(1000)) \
         .addBands(ee.Image(783).divide(1000)).addBands(ee.Image(842).divide(1000)) \
         .addBands(ee.Image(865).divide(1000)).addBands(ee.Image(1610).divide(1000)) \
         .addBands(ee.Image(2190).divide(1000)).toArray().toArray(1)
-
     koz = ee.Image(0.0039).addBands(ee.Image(0.0213)).addBands(ee.Image(0.1052)) \
         .addBands(ee.Image(0.0505)).addBands(ee.Image(0.0205)).addBands(ee.Image(0.0112)) \
         .addBands(ee.Image(0.0075)).addBands(ee.Image(0.0021)).addBands(ee.Image(0.0019)) \
         .addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
     Toz = koz.multiply(C["DU"]).divide(ee.Image(1000))
-    Lt = Ltoa.multiply((Toz).multiply((ee.Image(1).divide(C["cosdSunZe"])).add(ee.Image(1).divide(C["cosdSatZe"])) ).exp())
-
+    Lt = Ltoa.multiply((Toz).multiply((ee.Image(1).divide(C["cosdSunZe"])).add(ee.Image(1).divide(C["cosdSatZe"]))).exp())
     Tr = (C["P"].divide(C["Po"])).multiply(ee.Image(0.008569).multiply(bandCenter.pow(-4))) \
-        .multiply( (ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4)))) )
-
-    theta_neg = ((C["cosdSunZe"].multiply(ee.Image(-1))).multiply(C["cosdSatZe"])) \
-                .subtract((C["sindSunZe"]).multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
-    theta_neg_inv = theta_neg.acos().multiply(ee.Image(180).divide(pi))
-    theta_pos = C["cosdSunZe"].multiply(C["cosdSatZe"]) \
-        .subtract(C["sindSunZe"].multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
-    theta_pos_inv = theta_pos.acos().multiply(ee.Image(180).divide(pi))
-    cosd_tni = theta_neg_inv.multiply(pi.divide(180)).cos()
-    cosd_tpi = theta_pos_inv.multiply(pi.divide(180)).cos()
-    Pr_neg = ee.Image(0.75).multiply(ee.Image(1).add(cosd_tni.pow(2)))
-    Pr_pos = ee.Image(0.75).multiply(ee.Image(1).add(cosd_tpi.pow(2)))
-    R_theta_SZ = ee.Image(0)  # ปล่อย 0 (ส่วน Fresnel ให้ค่าต่ำมาก)
-    R_theta_V  = ee.Image(0)
-    Pr = Pr_neg.add((R_theta_SZ.add(R_theta_V)).multiply(Pr_pos))
-    denom = ee.Image(4).multiply(pi).multiply(C["cosdSatZe"])
-    Lr = (ESUN.multiply(Tr)).multiply(Pr.divide(denom))
-    Lrc = Lt.subtract(Lr)
-    LrcImg = Lrc.arrayProject([0]).arrayFlatten([bands])
-
-    bands_nm = ee.Image(443).addBands(ee.Image(490)).addBands(ee.Image(560)) \
-        .addBands(ee.Image(665)).addBands(ee.Image(705)).addBands(ee.Image(740)) \
-        .addBands(ee.Image(783)).addBands(ee.Image(842)).addBands(ee.Image(865)) \
-        .addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
-
-    Lam_10 = LrcImg.select('B11'); Lam_11 = LrcImg.select('B12')
-    eps = ( ( (Lam_11.divide(ESUNImg.select('B12'))).log() ).subtract( (Lam_10.divide(ESUNImg.select('B11'))).log() ) ) \
-          .divide(ee.Image(2190).subtract(ee.Image(1610)))
-    Lam = (Lam_11).multiply( (ESUN).divide(ESUNImg.select('B12')) ).multiply( (eps.multiply(ee.Image(-1))).multiply( (bands_nm.divide(ee.Image(2190))) ).exp() )
-    trans = Tr.multiply(ee.Image(-1)).divide(ee.Image(2)).multiply(ee.Image(1).divide(C["cosdSatZe"])).exp()
-    Lw = Lrc.subtract(Lam).divide(trans)
-    pw = (Lw.multiply(pi).multiply(C["d"].pow(2)).divide(ESUN.multiply(C["cosdSunZe"])))
-    Rrs = (pw.divide(pi).arrayProject([0]).arrayFlatten([bands]).slice(0,12))
-    return Rrs.set('system:time_start',img.get('system:time_start'))
-
-def s2_correction_sr(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image) -> ee.Image:
-    # ใช้กับ COPERNICUS/S2_SR (รวม B9)
-    bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12']
-    C = _s2_correction_common(img, bands, ini, end, mask)
-
-    ESUN = ee.Image(ee.Array([ee.Image(img.get('SOLAR_IRRADIANCE_B1')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B2')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B3')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B4')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B5')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B6')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B7')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B8')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B8A')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B9')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B11')),
-                              ee.Image(img.get('SOLAR_IRRADIANCE_B12'))])).toArray().toArray(1)
-    ESUN = ESUN.multiply(ee.Image(1))
-    ESUNImg = ESUN.arrayProject([0]).arrayFlatten([bands])
-    imgArr = C["rescale"].select(bands).toArray().toArray(1)
-    Ltoa = imgArr.multiply(ESUN).multiply(C["cosdSunZe"]).divide(pi.multiply(C["d"].pow(2)))
-
-    bandCenter = ee.Image(443).divide(1000).addBands(ee.Image(490).divide(1000)) \
-        .addBands(ee.Image(560).divide(1000)).addBands(ee.Image(665).divide(1000)) \
-        .addBands(ee.Image(705).divide(1000)).addBands(ee.Image(740).divide(1000)) \
-        .addBands(ee.Image(783).divide(1000)).addBands(ee.Image(842).divide(1000)) \
-        .addBands(ee.Image(865).divide(1000)).addBands(ee.Image(945).divide(1000)) \
-        .addBands(ee.Image(1610).divide(1000)).addBands(ee.Image(2190).divide(1000)).toArray().toArray(1)
-
-    koz = ee.Image(0.0039).addBands(ee.Image(0.0213)).addBands(ee.Image(0.1052)) \
-        .addBands(ee.Image(0.0505)).addBands(ee.Image(0.0205)).addBands(ee.Image(0.0112)) \
-        .addBands(ee.Image(0.0075)).addBands(ee.Image(0.0021)).addBands(ee.Image(0.0019)) \
-        .addBands(ee.Image(0.0011)).addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
-    Toz = koz.multiply(C["DU"]).divide(ee.Image(1000))
-    Lt = Ltoa.multiply((Toz).multiply((ee.Image(1).divide(C["cosdSunZe"])).add(ee.Image(1).divide(C["cosdSatZe"])) ).exp())
-
-    Tr = (C["P"].divide(C["Po"])).multiply(ee.Image(0.008569).multiply(bandCenter.pow(-4))) \
-        .multiply( (ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4)))) )
-
+        .multiply(ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4))))
     theta_neg = ((C["cosdSunZe"].multiply(ee.Image(-1))).multiply(C["cosdSatZe"])) \
                 .subtract((C["sindSunZe"]).multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
     theta_neg_inv = theta_neg.acos().multiply(ee.Image(180).divide(pi))
@@ -279,37 +182,119 @@ def s2_correction_sr(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image) 
     Lr = (ESUN.multiply(Tr)).multiply(Pr.divide(denom))
     Lrc = Lt.subtract(Lr)
     LrcImg = Lrc.arrayProject([0]).arrayFlatten([bands])
-
     bands_nm = ee.Image(443).addBands(ee.Image(490)).addBands(ee.Image(560)) \
         .addBands(ee.Image(665)).addBands(ee.Image(705)).addBands(ee.Image(740)) \
         .addBands(ee.Image(783)).addBands(ee.Image(842)).addBands(ee.Image(865)) \
-        .addBands(ee.Image(945)).addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
-
+        .addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
     Lam_10 = LrcImg.select('B11'); Lam_11 = LrcImg.select('B12')
-    eps = ( ( (Lam_11.divide(ESUNImg.select('B12'))).log() ).subtract( (Lam_10.divide(ESUNImg.select('B11'))).log() ) ) \
+    eps = ((Lam_11.divide(ESUNImg.select('B12'))).log().subtract((Lam_10.divide(ESUNImg.select('B11'))).log())) \
           .divide(ee.Image(2190).subtract(ee.Image(1610)))
-    Lam = (Lam_11).multiply( (ESUN).divide(ESUNImg.select('B12')) ).multiply( (eps.multiply(ee.Image(-1))).multiply( (bands_nm.divide(ee.Image(2190))) ).exp() )
+    Lam = Lam_11.multiply((ESUN).divide(ESUNImg.select('B12'))).multiply((eps.multiply(ee.Image(-1))).multiply((bands_nm.divide(ee.Image(2190)))).exp())
     trans = Tr.multiply(ee.Image(-1)).divide(ee.Image(2)).multiply(ee.Image(1).divide(C["cosdSatZe"])).exp()
     Lw = Lrc.subtract(Lam).divide(trans)
     pw = (Lw.multiply(pi).multiply(C["d"].pow(2)).divide(ESUN.multiply(C["cosdSunZe"])))
     Rrs = (pw.divide(pi).arrayProject([0]).arrayFlatten([bands]).slice(0,12))
     return Rrs.set('system:time_start',img.get('system:time_start'))
 
-# ---------- 4) Water-quality formulas ----------
-def img_pH(img):   return ee.Image(8.339).subtract(ee.Image(0.827).multiply(img.select('B1').divide(img.select('B8')))).rename('pH').copyProperties(img, ['system:time_start'])
-def img_turb(img): return ee.Image(100).multiply(ee.Image(1).subtract(img.normalizedDifference(['B8','B4']))).rename('turbidity').copyProperties(img, ['system:time_start'])
-def img_sal(img):  return img.normalizedDifference(['B11','B12']).rename('salinity_idx').copyProperties(img, ['system:time_start'])
-def img_do(img):   return (ee.Image(-0.0167).multiply(img.select('B8')).add(ee.Image(0.0067).multiply(img.select('B9'))).add(ee.Image(0.0083).multiply(img.select('B11'))).add(9.577)).rename('do_mgL').copyProperties(img, ['system:time_start'])
+def s2_correction_sr(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image) -> ee.Image:
+    bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12']
+    C = _s2_correction_common(img, bands, ini, end, mask)
+    ESUN = ee.Image(ee.Array([ee.Image(img.get('SOLAR_IRRADIANCE_B1')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B2')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B3')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B4')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B5')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B6')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B7')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B8')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B8A')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B9')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B11')),
+                              ee.Image(img.get('SOLAR_IRRADIANCE_B12'))])).toArray().toArray(1)
+    ESUN = ESUN.multiply(ee.Image(1))
+    ESUNImg = ESUN.arrayProject([0]).arrayFlatten([bands])
+    imgArr = C["rescale"].select(bands).toArray().toArray(1)
+    Ltoa = imgArr.multiply(ESUN).multiply(C["cosdSunZe"]).divide(pi.multiply(C["d"].pow(2)))
+    bandCenter = ee.Image(443).divide(1000).addBands(ee.Image(490).divide(1000)) \
+        .addBands(ee.Image(560).divide(1000)).addBands(ee.Image(665).divide(1000)) \
+        .addBands(ee.Image(705)).divide(1000).addBands(ee.Image(740)).divide(1000) \
+        .addBands(ee.Image(783)).divide(1000).addBands(ee.Image(842)).divide(1000) \
+        .addBands(ee.Image(865)).divide(1000).addBands(ee.Image(945)).divide(1000) \
+        .addBands(ee.Image(1610)).divide(1000).addBands(ee.Image(2190)).divide(1000) \
+        .toArray().toArray(1)
+    koz = ee.Image(0.0039).addBands(ee.Image(0.0213)).addBands(ee.Image(0.1052)) \
+        .addBands(ee.Image(0.0505)).addBands(ee.Image(0.0205)).addBands(ee.Image(0.0112)) \
+        .addBands(ee.Image(0.0075)).addBands(ee.Image(0.0021)).addBands(ee.Image(0.0019)) \
+        .addBands(ee.Image(0.0011)).addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
+    Toz = koz.multiply(C["DU"]).divide(ee.Image(1000))
+    Lt = Ltoa.multiply((Toz).multiply((ee.Image(1).divide(C["cosdSunZe"])).add(ee.Image(1).divide(C["cosdSatZe"]))).exp())
+    Tr = (C["P"].divide(C["Po"])).multiply(ee.Image(0.008569).multiply(bandCenter.pow(-4))) \
+        .multiply(ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4))))
+    theta_neg = ((C["cosdSunZe"].multiply(ee.Image(-1))).multiply(C["cosdSatZe"])) \
+                .subtract((C["sindSunZe"]).multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
+    theta_neg_inv = theta_neg.acos().multiply(ee.Image(180).divide(pi))
+    theta_pos = C["cosdSunZe"].multiply(C["cosdSatZe"]) \
+        .subtract((C["sindSunZe"]).multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
+    theta_pos_inv = theta_pos.acos().multiply(ee.Image(180).divide(pi))
+    cosd_tni = theta_neg_inv.multiply(pi.divide(180)).cos()
+    cosd_tpi = theta_pos_inv.multiply(pi.divide(180)).cos()
+    Pr_neg = ee.Image(0.75).multiply(ee.Image(1).add(cosd_tni.pow(2)))
+    Pr_pos = ee.Image(0.75).multiply(ee.Image(1).add(cosd_tpi.pow(2)))
+    R_theta_SZ = ee.Image(0); R_theta_V = ee.Image(0)
+    Pr = Pr_neg.add((R_theta_SZ.add(R_theta_V)).multiply(Pr_pos))
+    denom = ee.Image(4).multiply(pi).multiply(C["cosdSatZe"])
+    Lr = (ESUN.multiply(Tr)).multiply(Pr.divide(denom))
+    Lrc = Lt.subtract(Lr)
+    LrcImg = Lrc.arrayProject([0]).arrayFlatten([bands])
+    bands_nm = ee.Image(443).addBands(ee.Image(490)).addBands(ee.Image(560)) \
+        .addBands(ee.Image(665)).addBands(ee.Image(705)).addBands(ee.Image(740)) \
+        .addBands(ee.Image(783)).addBands(ee.Image(842)).addBands(ee.Image(865)) \
+        .addBands(ee.Image(945)).addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
+    Lam_10 = LrcImg.select('B11'); Lam_11 = LrcImg.select('B12')
+    eps = ((Lam_11.divide(ESUNImg.select('B12'))).log().subtract((Lam_10.divide(ESUNImg.select('B11'))).log())) \
+          .divide(ee.Image(2190).subtract(ee.Image(1610)))
+    Lam = Lam_11.multiply((ESUN).divide(ESUNImg.select('B12'))).multiply((eps.multiply(ee.Image(-1))).multiply((bands_nm.divide(ee.Image(2190)))).exp())
+    trans = Tr.multiply(ee.Image(-1)).divide(ee.Image(2)).multiply(ee.Image(1).divide(C["cosdSatZe"])).exp()
+    Lw = Lrc.subtract(Lam).divide(trans)
+    pw = (Lw.multiply(pi).multiply(C["d"].pow(2)).divide(ESUN.multiply(C["cosdSunZe"])))
+    Rrs = (pw.divide(pi).arrayProject([0]).arrayFlatten([bands]).slice(0,12))
+    return Rrs.set('system:time_start',img.get('system:time_start'))
+
+# ---------- 4) Water-quality (with masking ranges) ----------
+def img_pH(img):
+    ph = ee.Image(8.339).subtract(ee.Image(0.827).multiply(img.select('B1').divide(img.select('B8')))).rename('pH')
+    return ph.updateMask(ph.gte(0).And(ph.lte(14))).copyProperties(img, ['system:time_start'])
+
+def img_turb(img):
+    tur = ee.Image(100).multiply(ee.Image(1).subtract(img.normalizedDifference(['B8','B4']))).rename('turbidity')
+    return tur.updateMask(tur.lt(100)).copyProperties(img, ['system:time_start'])
+
+def img_sal(img):
+    return img.normalizedDifference(['B11','B12']).rename('salinity_idx').copyProperties(img, ['system:time_start'])
+
+def img_do(img):
+    dox = (ee.Image(-0.0167).multiply(img.select('B8'))
+           .add(ee.Image(0.0067).multiply(img.select('B9')))
+           .add(ee.Image(0.0083).multiply(img.select('B11')))
+           .add(9.577)).rename('do_mgL')
+    return dox.copyProperties(img, ['system:time_start'])
+
 def img_chl(img):
     ndci = img.normalizedDifference(['B5','B4'])
-    return ee.Image(14.039).add(ee.Image(86.115).multiply(ndci)).add(ee.Image(194.325).multiply(ndci.pow(2))).rename('chl_a').copyProperties(img, ['system:time_start'])
+    chl = ee.Image(14.039).add(ee.Image(86.115).multiply(ndci)).add(ee.Image(194.325).multiply(ndci.pow(2))).rename('chl_a')
+    return chl.updateMask(chl.lt(100)).copyProperties(img, ['system:time_start'])
+
 def img_zsd(img):
     blueRed = img.select('B2').divide(img.select('B4')).log()
-    lnMOSD = ee.Image(1.4856).multiply(blueRed).add(0.2734)
-    return (ee.Image(0.1777).multiply(ee.Image(10).pow(lnMOSD)).add(1.0813)).rename('secchi_m').copyProperties(img, ['system:time_start'])
-def img_tsi_from_chl(chl_img): return ee.Image(30.6).add(ee.Image(9.81).multiply(chl_img.log())).rename('tsi').copyProperties(chl_img, ['system:time_start'])
+    lnMOSD  = ee.Image(1.4856).multiply(blueRed).add(0.2734)
+    zsd     = (ee.Image(0.1777).multiply(ee.Image(10).pow(lnMOSD)).add(1.0813)).rename('secchi_m')
+    return zsd.updateMask(zsd.lt(10)).copyProperties(img, ['system:time_start'])
 
-# ---------- 5) TSI reclass (1–7) ----------
+def img_tsi_from_chl(chl_img):
+    tsi = ee.Image(30.6).add(ee.Image(9.81).multiply(chl_img.log())).rename('tsi')
+    return tsi.copyProperties(chl_img, ['system:time_start'])
+
+# ---------- 5) TSI reclass ----------
 def tsi_reclass(tsi_img: ee.Image) -> ee.Image:
     img = tsi_img
     mask1 = img.lt(30)
@@ -319,7 +304,6 @@ def tsi_reclass(tsi_img: ee.Image) -> ee.Image:
     mask5 = img.gte(60).And(img.lt(70))
     mask6 = img.gte(70).And(img.lt(80))
     mask7 = img.gte(80)
-
     img1 = img.where(mask1.eq(1), 1).mask(mask1)
     img2 = img.where(mask2.eq(1), 2).mask(mask2)
     img3 = img.where(mask3.eq(1), 3).mask(mask3)
@@ -327,7 +311,6 @@ def tsi_reclass(tsi_img: ee.Image) -> ee.Image:
     img5 = img.where(mask5.eq(1), 5).mask(mask5)
     img6 = img.where(mask6.eq(1), 6).mask(mask6)
     img7 = img.where(mask7.eq(1), 7).mask(mask7)
-
     out = img1.unmask(img2).unmask(img3).unmask(img4).unmask(img5).unmask(img6).unmask(img7)
     return out.rename('tsi_class').copyProperties(tsi_img, ['system:time_start'])
 
@@ -335,30 +318,44 @@ def tsi_reclass(tsi_img: ee.Image) -> ee.Image:
 SCALE = 20
 MAXPX = 1e13
 
-def monthly_series(ic: ee.ImageCollection, geom: ee.Geometry, band: str, year: int) -> List[Dict[str, Any]]:
+def monthly_series(ic: ee.ImageCollection, geom: ee.Geometry, band: str, year: int,
+                   agg: Literal["scene","stack"]="scene",
+                   min_images:int=1) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for m in range(1, 13):
         start = ee.Date.fromYMD(year, m, 1)
         end   = start.advance(1, "month")
         month_ic = ic.filterDate(start, end)
+        count = int(ee.Number(month_ic.size()).getInfo())
 
-        safe_img = ee.Image(
-            ee.Algorithms.If(
-                month_ic.size().gt(0),
-                (month_ic.mode() if band == 'tsi_class' else month_ic.mean()).clip(geom),
-                ee.Image.constant(0).rename(band).updateMask(ee.Image(0)).clip(geom)
-            )
-        )
+        # รายการวันที่ภาพ (string)
+        dates = ee.List(month_ic.aggregate_array('system:time_start')) \
+                    .map(lambda t: ee.Date(t).format("YYYY-MM-dd")).getInfo()
 
-        reducer = ee.Reducer.mode() if band == 'tsi_class' else ee.Reducer.mean()
-        val = ee.Image(safe_img).select(band).reduceRegion(reducer, geom, SCALE, maxPixels=MAXPX).get(band)
-        vpy = None
-        try:
-            if val is not None:
-                vpy = float(ee.Number(val).getInfo())
-        except Exception:
-            vpy = None
-        out.append({"month": m, "value": vpy})
+        if count < min_images:
+            out.append({"month": m, "value": None, "count": count, "dates": dates})
+            continue
+
+        if band == 'tsi_class':
+            img = month_ic.mode().clip(geom)
+            reducer = ee.Reducer.mode()
+            val = img.select(band).reduceRegion(reducer, geom, SCALE, maxPixels=MAXPX).get(band)
+            v = float(ee.Number(val).getInfo()) if val is not None else None
+        elif agg == "scene":
+            # เฉลี่ยต่อฉาก -> เอาค่าเฉลี่ยของฉากทั้งหมดมาเฉลี่ยอีกที
+            def per_im(im):
+                r = im.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX).get(band)
+                return ee.Feature(None, {"v": r})
+            feats = ee.FeatureCollection(month_ic.map(per_im)).getInfo().get("features", [])
+            vals = [f["properties"]["v"] for f in feats if f["properties"]["v"] is not None]
+            v = (sum(vals)/len(vals)) if len(vals)>0 else None
+        else:  # stack
+            img = month_ic.mean().clip(geom)
+            reducer = ee.Reducer.mean()
+            val = img.select(band).reduceRegion(reducer, geom, SCALE, maxPixels=MAXPX).get(band)
+            v = float(ee.Number(val).getInfo()) if val is not None else None
+
+        out.append({"month": m, "value": v, "count": count, "dates": dates})
     return out
 
 def scenes_series(ic: ee.ImageCollection, geom: ee.Geometry, band: str) -> List[Dict[str, Any]]:
@@ -380,6 +377,8 @@ def scenes_series(ic: ee.ImageCollection, geom: ee.Geometry, band: str) -> List[
 class MonthlyPoint(BaseModel):
     month: int
     value: Optional[float] = None
+    count: int
+    dates: List[str] = []
 
 class ScenePoint(BaseModel):
     date: str
@@ -390,6 +389,8 @@ class TSMonthlyResponse(BaseModel):
     year: int
     cloud_perc: int
     ac: Literal["none","full"]
+    agg: Literal["scene","stack"]
+    min_images: int
     monthly: Dict[str, List[MonthlyPoint]]
 
 class TSScenesResponse(BaseModel):
@@ -410,7 +411,7 @@ class TileResponse(BaseModel):
     name: str
     tiles: Dict[str, str]
 
-# ---------- 8) Build collections by mode ----------
+# ---------- 8) Build collections ----------
 def build_collections(geom, ini, end, cloud_perc, mask, ac: Literal["none","full"]):
     sr_scaled = s2_sr(geom, ini, end, cloud_perc).map(lambda im: add_scaled(im, mask))
     out = {"sr_scaled": sr_scaled}
@@ -434,7 +435,9 @@ def timeseries_monthly(
     station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
     year: int = Query(..., ge=2017, le=2025),
     cloud_perc: int = Query(30, ge=0, le=100),
-    ac: Literal["none","full"] = "none"
+    ac: Literal["none","full"] = "none",
+    agg: Literal["scene","stack"] = "scene",
+    min_images: int = Query(1, ge=0, le=20),
 ):
     if station not in AOIS: raise HTTPException(404, "Unknown station")
     geom = AOIS[station]; ini, end = get_window(year)
@@ -456,15 +459,16 @@ def timeseries_monthly(
 
     return {
         "station": station, "year": year, "cloud_perc": cloud_perc, "ac": ac,
+        "agg": agg, "min_images": min_images,
         "monthly": {
-            "pH":           monthly_series(ph_ic,  geom, "pH",        year),
-            "turbidity":    monthly_series(tur_ic, geom, "turbidity", year),
-            "salinity_idx": monthly_series(sal_ic, geom, "salinity_idx", year),
-            "do_mgL":       monthly_series(do_ic,  geom, "do_mgL",    year),
-            "chl_a":        monthly_series(chl_ic, geom, "chl_a",     year),
-            "secchi_m":     monthly_series(zsd_ic, geom, "secchi_m",  year),
-            "tsi":          monthly_series(tsi_ic, geom, "tsi",       year),
-            "tsi_class":    monthly_series(tsi_cls_ic, geom, "tsi_class", year)
+            "pH":           monthly_series(ph_ic,  geom, "pH",        year, agg, min_images),
+            "turbidity":    monthly_series(tur_ic, geom, "turbidity", year, agg, min_images),
+            "salinity_idx": monthly_series(sal_ic, geom, "salinity_idx", year, agg, min_images),
+            "do_mgL":       monthly_series(do_ic,  geom, "do_mgL",    year, agg, min_images),
+            "chl_a":        monthly_series(chl_ic, geom, "chl_a",     year, agg, min_images),
+            "secchi_m":     monthly_series(zsd_ic, geom, "secchi_m",  year, agg, min_images),
+            "tsi":          monthly_series(tsi_ic, geom, "tsi",       year, agg, min_images),
+            "tsi_class":    monthly_series(tsi_cls_ic, geom, "tsi_class", year, agg, min_images),
         }
     }
 
@@ -475,7 +479,6 @@ def timeseries_scenes(
     cloud_perc: int = Query(30, ge=0, le=100),
     ac: Literal["none","full"] = "none"
 ):
-    """ซีรีส์ตามทุกฉากภาพ (จุดตามวันที่ภาพจริง)"""
     if station not in AOIS: raise HTTPException(404, "Unknown station")
     geom = AOIS[station]; ini, end = get_window(year)
     mask = build_water_mask(geom)
@@ -551,7 +554,6 @@ def map_png(
     ac: Literal["none","full"] = "none",
     width: int = 1024, height: int = 1024
 ):
-    """PNG สำหรับส่งเข้า LINE (เฉลี่ยทั้งปีของเลเยอร์ที่เลือก)"""
     if station not in AOIS: raise HTTPException(404, "Unknown station")
     geom = AOIS[station]; ini, end = get_window(year)
     mask = build_water_mask(geom)
@@ -568,11 +570,7 @@ def map_png(
         img = base_for_chl_sd.map(img_chl).map(img_tsi_from_chl).mean().clip(geom)
         vis = {"min":30,"max":80,"palette":['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
 
-    thumb = img.visualize(**vis).getThumbURL({
-        "dimensions": f"{width}x{height}",
-        "region": geom,
-        "format": "png"
-    })
+    thumb = img.visualize(**vis).getThumbURL({"dimensions": f"{width}x{height}","region": geom,"format": "png"})
     return {"station": station, "year": year, "layer": layer, "ac": ac, "png": thumb}
 
 @app.get("/tiles", response_model=TileResponse)
@@ -608,7 +606,7 @@ def tiles(
 def root():
     return {"name":"Aqua Sight API",
             "examples":{
-                "monthly":"/timeseries_monthly?station=CP01&year=2024&ac=full",
+                "monthly":"/timeseries_monthly?station=CP01&year=2024&ac=full&agg=scene",
                 "scenes":"/timeseries_scenes?station=CP01&year=2024&ac=full",
                 "summary":"/summary_year?station=CP01&year=2024&ac=full",
                 "png":"/map_png?station=CP01&year=2024&layer=chl_a&ac=full",
@@ -617,22 +615,15 @@ def root():
 @app.get("/health-ee")
 def health_ee():
     try:
-        # ทดสอบเรียก API โดยไม่ re-initialize ซ้ำ
-        # ถ้า init ตอนบูตผ่านแล้ว อันนี้ควรทำงาน
         return {"ok": True, "roots": ee.data.getAssetRoots()}
     except Exception as e:
-        # โชว์ว่ากำลังใช้ env อะไรบ้าง จะช่วยไล่ปัญหาได้เร็ว
         return {
-            "ok": False,
-            "error": str(e),
+            "ok": False, "error": str(e),
             "has_EE_SERVICE_ACCOUNT": bool(os.getenv("EE_SERVICE_ACCOUNT")),
             "has_EE_KEY_B64": bool(os.getenv("EE_KEY_B64")),
             "has_GOOGLE_APPLICATION_CREDENTIALS_JSON": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")),
         }
 
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
-
