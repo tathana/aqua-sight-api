@@ -1,4 +1,4 @@
-# main.py — Aqua Sight API (monthly agg + min_images + safe parsing)
+# main.py — Aqua Sight API (monthly agg + min_images + safe parsing + tsi_class mode)
 
 import os, json, base64, tempfile
 from typing import Dict, List, Literal, Any, Optional
@@ -32,7 +32,7 @@ try:
 except Exception as e:
     raise RuntimeError(f"Earth Engine init failed: {e}")
 
-app = FastAPI(title="Aqua Sight API", version="1.3.0")
+app = FastAPI(title="Aqua Sight API", version="1.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,6 +69,7 @@ def get_window(year:int):
     return ini, end
 
 def build_water_mask(geom: ee.Geometry) -> ee.Image:
+    # Simple LS9 SR_B6 threshold mask (no scale) — consistent with earlier behavior
     SRP = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2").select('SR_B6')
     col = (SRP.filterBounds(geom)
              .filter(ee.Filter.lt('CLOUD_COVER',30))
@@ -110,7 +111,9 @@ def tsi_reclass(tsi_img: ee.Image) -> ee.Image:
     mask5 = img.gte(60).And(img.lt(70))
     mask6 = img.gte(70).And(img.lt(80))
     mask7 = img.gte(80)
-    out = img.where(mask1, 1).where(mask2, 2).where(mask3, 3).where(mask4, 4).where(mask5, 5).where(mask6, 6).where(mask7, 7)
+    out = (ee.Image(0)
+           .where(mask1, 1).where(mask2, 2).where(mask3, 3)
+           .where(mask4, 4).where(mask5, 5).where(mask6, 6).where(mask7, 7))
     return out.rename('tsi_class').copyProperties(tsi_img, ['system:time_start'])
 
 # ---------- 4) Series helpers ----------
@@ -124,6 +127,19 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
+def _reduce_value(img: ee.Image, geom: ee.Geometry, band: str):
+    """ReduceRegion สำหรับ 1 รูป:
+       - ถ้า band == 'tsi_class' ใช้ mode แล้วคืนค่าคีย์ 'mode'
+       - อื่น ๆ ใช้ mean แล้วคืนค่าคีย์เป็นชื่อ band
+    """
+    if band == 'tsi_class':
+        reduced = img.select(band).reduceRegion(ee.Reducer.mode(), geom, SCALE, maxPixels=MAXPX)
+        key, val = 'mode', reduced.get('mode')
+    else:
+        reduced = img.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX)
+        key, val = band, reduced.get(band)
+    return key, val
+
 def monthly_series(
     ic: ee.ImageCollection,
     geom: ee.Geometry,
@@ -134,8 +150,8 @@ def monthly_series(
 ) -> List[Dict[str, Any]]:
     """
     agg = mean|median  -> รวมภาพทั้งเดือนแล้ว reduceRegion
-    agg = scene        -> คิดค่าของแต่ละ scene แล้วเอาค่าเฉลี่ยของ scene ภายในเดือน
-    min_images        -> น้อยกว่านี้ให้คืน None
+    agg = scene        -> คำนวณค่าต่อ scene แล้วเฉลี่ยใน Python
+    min_images        -> ถ้าจำนวน scene < min_images ให้คืน None
     """
     out: List[Dict[str, Any]] = []
     for m in range(1, 12+1):
@@ -143,42 +159,46 @@ def monthly_series(
         end   = start.advance(1, "month")
         month_ic = ic.filterDate(start, end)
 
-        # ตรวจจำนวนภาพ (ปลายทางจะใช้ getInfo แค่ตัวเลขเดียวต่อเดือน)
-        count = int(ee.Number(month_ic.size()).getInfo())
+        # นับจำนวนภาพ
+        try:
+            count = int(ee.Number(month_ic.size()).getInfo())
+        except Exception:
+            count = 0
+
         if count < min_images:
             out.append({"month": m, "value": None})
             continue
 
         if agg in ("mean","median"):
             img = month_ic.mean() if agg == "mean" else month_ic.median()
-            val = img.select(band).reduceRegion(
-                ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX
-            ).get(band)
+            _, val = _reduce_value(img, geom, band)
             out.append({"month": m, "value": _safe_float(ee.Number(val).getInfo() if val is not None else None)})
         else:
             # agg = 'scene' : คิดค่าต่อภาพก่อน แล้วค่อยเฉลี่ยใน Python
             def per_img(image):
-                v = image.select(band).reduceRegion(
-                    ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX
-                ).get(band)
-                # คืน property ชื่อ 'v' เสมอ
+                # ใช้ reducer ให้สอดคล้องกับชนิด band
+                if band == 'tsi_class':
+                    v = image.select(band).reduceRegion(ee.Reducer.mode(), geom, SCALE, maxPixels=MAXPX).get('mode')
+                else:
+                    v = image.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX).get(band)
                 return ee.Feature(None, {"v": v})
 
             feats = ee.FeatureCollection(month_ic.map(per_img)).getInfo().get("features", [])
             vals: List[float] = []
             for f in feats:
                 props = f.get("properties") or {}
-                v = props.get("v")  # อย่า index ตรง ๆ เพื่อกัน KeyError
-                fv = _safe_float(v)
+                fv = _safe_float(props.get("v"))  # ป้องกัน KeyError
                 if fv is not None:
                     vals.append(fv)
-
             out.append({"month": m, "value": (sum(vals)/len(vals) if len(vals) else None)})
     return out
 
 def scenes_series(ic: ee.ImageCollection, geom: ee.Geometry, band: str) -> List[Dict[str, Any]]:
     def per_image(img):
-        v = img.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX).get(band)
+        if band == 'tsi_class':
+            v = img.select(band).reduceRegion(ee.Reducer.mode(), geom, SCALE, maxPixels=MAXPX).get('mode')
+        else:
+            v = img.select(band).reduceRegion(ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX).get(band)
         return ee.Feature(None, {
             "date": ee.Date(img.get('system:time_start')).format("YYYY-MM-dd"),
             "value": v
@@ -221,6 +241,7 @@ class TSScenesResponse(BaseModel):
 
 # ---------- 6) Build collections ----------
 def build_collections(geom, ini, end, cloud_perc, mask):
+    # ใช้ S2 SR + scale + water mask (โหมด AC แบบง่าย)
     sr_scaled = s2_sr(geom, ini, end, cloud_perc).map(lambda im: add_scaled(im, mask))
     return sr_scaled
 
@@ -238,7 +259,7 @@ def timeseries_monthly(
     station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
     year: int = Query(..., ge=2017, le=2025),
     cloud_perc: int = Query(30, ge=0, le=100),
-    ac: Literal["none","full"] = "none",
+    ac: Literal["none","full"] = "none",               # reserved (ยังไม่เปิดใช้ full AC ในไฟล์นี้)
     agg: Literal["mean","median","scene"] = "mean",
     min_images: int = Query(1, ge=1, le=50)
 ):
