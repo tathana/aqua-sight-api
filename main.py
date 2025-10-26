@@ -651,62 +651,48 @@ def map_png_proxy(
     ac: Literal["none","full"] = "none",
     width: int = 1024, height: int = 1024
 ):
-    """สร้างภาพ (เหมือน /map_png) แล้วสตรีม PNG กลับทันที (ใช้ POST ไปยัง :getPixels)"""
+    """สร้างภาพจาก Earth Engine โดยตรง (ไม่ใช้ getThumbURL)"""
     if station not in AOIS:
         raise HTTPException(404, "Unknown station")
 
-    geom = AOIS[station]; ini, end = get_window(year)
+    geom = AOIS[station]
+    ini, end = get_window(year)
     mask = build_water_mask(geom)
     cols = build_collections(geom, ini, end, cloud_perc, mask, ac)
-    base_for_chl_sd = cols["toa_rrs"] if ac=="full" else cols["sr_scaled"]
+    base_for_chl_sd = cols["toa_rrs"] if ac == "full" else cols["sr_scaled"]
 
+    # --- สร้างภาพตาม layer ---
     if layer == "chl_a":
         img = base_for_chl_sd.map(img_chl).mean().clip(geom)
-        vis = {"min":0,"max":40,"palette":['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
+        vis = {"min": 0, "max": 40, "palette": ['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
     elif layer == "secchi":
         img = base_for_chl_sd.map(img_zsd).mean().clip(geom)
-        vis = {"min":0,"max":2,"palette":['800000','FF9700','7BFF7B','0080FF','000080']}
+        vis = {"min": 0, "max": 2, "palette": ['800000','FF9700','7BFF7B','0080FF','000080']}
     else:
         img = base_for_chl_sd.map(img_chl).map(img_tsi_from_chl).mean().clip(geom)
-        vis = {"min":30,"max":80,"palette":['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
+        vis = {"min": 30, "max": 80, "palette": ['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
 
-    png_url = img.visualize(**vis).getThumbURL({
-        "dimensions": f"{width}x{height}",
-        "region": geom,
-        "format": "png",
-    })
-
+    # --- สร้างภาพโดยตรงจาก EE (ไม่ต้องผ่าน URL) ---
     try:
-        # EE thumbnails ต้อง POST
-        r = requests.post(
-            png_url,
-            stream=True,
-            timeout=30,
-            headers={"User-Agent": "AquaSight-Proxy/1.0"}
+        png_bytes = ee.data.getThumbnail(
+            {
+                "image": img.visualize(**vis),
+                "dimensions": f"{width}x{height}",
+                "region": geom.toGeoJSONString(),
+                "format": "png",
+            },
+            30000  # timeout 30 วินาที
         )
-        r.raise_for_status()
-        return StreamingResponse(
-            r.raw,
+        if not png_bytes:
+            raise HTTPException(500, "Empty PNG from Earth Engine")
+
+        return Response(
+            content=png_bytes,
             media_type="image/png",
             headers={"Cache-Control": "public, max-age=300"}
         )
-    except requests.RequestException as e:
-        # สำรอง: บางสภาพแวดล้อม GET อาจใช้ได้ ลองอีกครั้งแบบ GET
-        try:
-            rg = requests.get(
-                png_url,
-                stream=True,
-                timeout=30,
-                headers={"User-Agent": "AquaSight-Proxy/1.0"}
-            )
-            rg.raise_for_status()
-            return StreamingResponse(
-                rg.raw,
-                media_type="image/png",
-                headers={"Cache-Control": "public, max-age=300"}
-            )
-        except requests.RequestException:
-            raise HTTPException(status_code=502, detail=f"Fetch PNG failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"การดึงข้อมูล PNG ล้มเหลว: {e}")
 
 if __name__ == "__main__":
     import uvicorn
