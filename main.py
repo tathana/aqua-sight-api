@@ -1,11 +1,16 @@
-#ver แรก main.py — Aqua Sight API (TSI reclass + per-scene series + full atmospheric correction)
+# ver แรก main.py — Aqua Sight API (TSI reclass + per-scene series + full atmospheric correction)
 
-import os, json, base64 , tempfile
+import os, json, base64, tempfile, re
 from typing import Dict, List, Literal, Any, Optional
+
+import requests
+import ee
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import ee
+
 
 # ---------- 0) Earth Engine Init ----------
 cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -630,6 +635,39 @@ def health_ee():
             "has_GOOGLE_APPLICATION_CREDENTIALS_JSON": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")),
         }
 
+EE_THUMB_PATTERN = re.compile(
+    r"^https://earthengine\.googleapis\.com/.*:getPixels(?:\?.*)?$"
+)
+
+@app.get("/proxy_png")
+def proxy_png(url: str):
+    """
+    รับ URL แบบ Earth Engine thumbnails `...:getPixels`
+    → เซิร์ฟเวอร์เราจะ POST ไปหา EE เอง แล้วสตรีมผลกลับเป็น image/png
+    ใช้แทน URL ต้นฉบับได้เลย (เหมาะกับ LINE ที่ต้องการ HTTPS public GET)
+    """
+    # 1) ป้องกัน misuse: ยอมรับเฉพาะโดเมน EE เท่านั้น
+    if not EE_THUMB_PATTERN.match(url):
+        raise HTTPException(status_code=400, detail="Invalid EE thumbnail URL")
+
+    try:
+        # 2) POST ไปหา EE (ส่วนใหญ่ไม่ต้องมี body) และสตรีมผลลัพธ์
+        #    ใส่ timeout + UA เพื่อความเสถียร
+        r = requests.post(
+            url, stream=True, timeout=30,
+            headers={"User-Agent": "AquaSight-Proxy/1.0"}
+        )
+        r.raise_for_status()
+
+        # 3) ส่งกลับเป็น image/png (สตรีม), ไม่โหลดเข้าหน่วยความจำทั้งหมด
+        return StreamingResponse(
+            r.raw, media_type="image/png",
+            headers={
+                "Cache-Control": "public, max-age=300",  # cache 5 นาที
+            },
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Proxy fetch failed: {e}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,67 @@
+{
+  "name": "AquaSight LINE Bot - Echo (Webhook → Reply API)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "line-bot",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 200,
+          "responseData": "OK"
+        }
+      },
+      "id": "Webhook_Trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [280, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.line.me/v2/bot/message/reply",
+        "responseFormat": "json",
+        "sendHeaders": true,
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_CHANNEL_ACCESS_TOKEN"
+            }
+          ]
+        },
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "={{ JSON.stringify({ replyToken: $json.body.events[0].replyToken, messages: [ { type: 'text', text: ($json.body.events[0].message && $json.body.events[0].message.text) ? $json.body.events[0].message.text : 'ขอบคุณที่ทักมานะครับ 👋' } ] }) }}"
+      },
+      "id": "HTTP_Reply",
+      "name": "Reply to LINE",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Reply to LINE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetup": []
+  },
+  "active": true
+}
