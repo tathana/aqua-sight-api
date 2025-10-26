@@ -8,7 +8,7 @@ import ee
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
 
@@ -44,6 +44,7 @@ try:
         )
 except Exception as e:
     raise RuntimeError(f"Earth Engine init failed: {e}")
+
 app = FastAPI(title="Aqua Sight API", version="1.2.0")
 
 # CORS: ตั้งได้หลายโดเมนด้วยจุลภาค
@@ -194,7 +195,7 @@ def s2_correction_toa(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image)
     Lt = Ltoa.multiply((Toz).multiply((ee.Image(1).divide(C["cosdSunZe"])).add(ee.Image(1).divide(C["cosdSatZe"])) ).exp())
 
     Tr = (C["P"].divide(C["Po"])).multiply(ee.Image(0.008569).multiply(bandCenter.pow(-4))) \
-        .multiply( (ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4)))) )
+        .multiply((ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4)))))
 
     theta_neg = ((C["cosdSunZe"].multiply(ee.Image(-1))).multiply(C["cosdSatZe"])) \
                 .subtract((C["sindSunZe"]).multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
@@ -220,9 +221,9 @@ def s2_correction_toa(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image)
         .addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
 
     Lam_10 = LrcImg.select('B11'); Lam_11 = LrcImg.select('B12')
-    eps = ( ( (Lam_11.divide(ESUNImg.select('B12'))).log() ).subtract( (Lam_10.divide(ESUNImg.select('B11'))).log() ) ) \
+    eps = (((Lam_11.divide(ESUNImg.select('B12'))).log()).subtract((Lam_10.divide(ESUNImg.select('B11'))).log())) \
           .divide(ee.Image(2190).subtract(ee.Image(1610)))
-    Lam = (Lam_11).multiply( (ESUN).divide(ESUNImg.select('B12')) ).multiply( (eps.multiply(ee.Image(-1))).multiply( (bands_nm.divide(ee.Image(2190))) ).exp() )
+    Lam = (Lam_11).multiply((ESUN).divide(ESUNImg.select('B12'))).multiply((eps.multiply(ee.Image(-1))).multiply((bands_nm.divide(ee.Image(2190)))).exp())
     trans = Tr.multiply(ee.Image(-1)).divide(ee.Image(2)).multiply(ee.Image(1).divide(C["cosdSatZe"])).exp()
     Lw = Lrc.subtract(Lam).divide(trans)
     pw = (Lw.multiply(pi).multiply(C["d"].pow(2)).divide(ESUN.multiply(C["cosdSunZe"])))
@@ -266,7 +267,7 @@ def s2_correction_sr(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image) 
     Lt = Ltoa.multiply((Toz).multiply((ee.Image(1).divide(C["cosdSunZe"])).add(ee.Image(1).divide(C["cosdSatZe"])) ).exp())
 
     Tr = (C["P"].divide(C["Po"])).multiply(ee.Image(0.008569).multiply(bandCenter.pow(-4))) \
-        .multiply( (ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4)))) )
+        .multiply((ee.Image(1).add(ee.Image(0.0113).multiply(bandCenter.pow(-2))).add(ee.Image(0.00013).multiply(bandCenter.pow(-4)))))
 
     theta_neg = ((C["cosdSunZe"].multiply(ee.Image(-1))).multiply(C["cosdSatZe"])) \
                 .subtract((C["sindSunZe"]).multiply(C["sindSatZe"]).multiply(C["cosdRelAz"]))
@@ -291,9 +292,9 @@ def s2_correction_sr(img: ee.Image, ini: ee.Date, end: ee.Date, mask: ee.Image) 
         .addBands(ee.Image(945)).addBands(ee.Image(0)).addBands(ee.Image(0)).toArray().toArray(1)
 
     Lam_10 = LrcImg.select('B11'); Lam_11 = LrcImg.select('B12')
-    eps = ( ( (Lam_11.divide(ESUNImg.select('B12'))).log() ).subtract( (Lam_10.divide(ESUNImg.select('B11'))).log() ) ) \
+    eps = (((Lam_11.divide(ESUNImg.select('B12'))).log()).subtract((Lam_10.divide(ESUNImg.select('B11'))).log())) \
           .divide(ee.Image(2190).subtract(ee.Image(1610)))
-    Lam = (Lam_11).multiply( (ESUN).divide(ESUNImg.select('B12')) ).multiply( (eps.multiply(ee.Image(-1))).multiply( (bands_nm.divide(ee.Image(2190))) ).exp() )
+    Lam = (Lam_11).multiply((ESUN).divide(ESUNImg.select('B12'))).multiply((eps.multiply(ee.Image(-1))).multiply((bands_nm.divide(ee.Image(2190)))).exp())
     trans = Tr.multiply(ee.Image(-1)).divide(ee.Image(2)).multiply(ee.Image(1).divide(C["cosdSatZe"])).exp()
     Lw = Lrc.subtract(Lam).divide(trans)
     pw = (Lw.multiply(pi).multiply(C["d"].pow(2)).divide(ESUN.multiply(C["cosdSunZe"])))
@@ -622,11 +623,8 @@ def root():
 @app.get("/health-ee")
 def health_ee():
     try:
-        # ทดสอบเรียก API โดยไม่ re-initialize ซ้ำ
-        # ถ้า init ตอนบูตผ่านแล้ว อันนี้ควรทำงาน
         return {"ok": True, "roots": ee.data.getAssetRoots()}
     except Exception as e:
-        # โชว์ว่ากำลังใช้ env อะไรบ้าง จะช่วยไล่ปัญหาได้เร็ว
         return {
             "ok": False,
             "error": str(e),
@@ -635,35 +633,37 @@ def health_ee():
             "has_GOOGLE_APPLICATION_CREDENTIALS_JSON": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")),
         }
 
+# --- Proxy for EE thumbnails (:getPixels) ---
 EE_THUMB_PATTERN = re.compile(
-    r"^https://earthengine\.googleapis\.com/.*:getPixels(?:\?.*)?$"
+    r"^https://earthengine(?:-highvolume)?\.googleapis\.com/.+:getPixels(?:\?.*)?$"
 )
 
 @app.get("/proxy_png")
 def proxy_png(url: str):
     """
     รับ URL แบบ Earth Engine thumbnails `...:getPixels`
-    → เซิร์ฟเวอร์เราจะ POST ไปหา EE เอง แล้วสตรีมผลกลับเป็น image/png
-    ใช้แทน URL ต้นฉบับได้เลย (เหมาะกับ LINE ที่ต้องการ HTTPS public GET)
+    → POST ไปหา EE แล้วส่ง bytes กลับเป็น image/png พร้อม Content-Length
+    (เหมาะกับ LINE ที่ต้องการ HTTPS public GET)
     """
-    # 1) ป้องกัน misuse: ยอมรับเฉพาะโดเมน EE เท่านั้น
     if not EE_THUMB_PATTERN.match(url):
         raise HTTPException(status_code=400, detail="Invalid EE thumbnail URL")
 
     try:
-        # 2) POST ไปหา EE (ส่วนใหญ่ไม่ต้องมี body) และสตรีมผลลัพธ์
-        #    ใส่ timeout + UA เพื่อความเสถียร
         r = requests.post(
-            url, stream=True, timeout=30,
-            headers={"User-Agent": "AquaSight-Proxy/1.0"}
+            url,
+            timeout=60,
+            headers={"User-Agent": "AquaSight-Proxy/1.0"},
         )
         r.raise_for_status()
 
-        # 3) ส่งกลับเป็น image/png (สตรีม), ไม่โหลดเข้าหน่วยความจำทั้งหมด
-        return StreamingResponse(
-            r.raw, media_type="image/png",
+        data = r.content
+        return Response(
+            content=data,
+            media_type="image/png",
             headers={
-                "Cache-Control": "public, max-age=300",  # cache 5 นาที
+                "Cache-Control": "public, max-age=300",
+                "Content-Length": str(len(data)),
+                "X-Content-Type-Options": "nosniff",
             },
         )
     except requests.RequestException as e:
@@ -673,4 +673,3 @@ def proxy_png(url: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
-
