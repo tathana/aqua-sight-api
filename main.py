@@ -638,36 +638,51 @@ EE_THUMB_PATTERN = re.compile(
     r"^https://earthengine(?:-highvolume)?\.googleapis\.com/.+:getPixels(?:\?.*)?$"
 )
 
-@app.get("/proxy_png")
-def proxy_png(url: str):
-    """
-    รับ URL แบบ Earth Engine thumbnails `...:getPixels`
-    → POST ไปหา EE แล้วส่ง bytes กลับเป็น image/png พร้อม Content-Length
-    (เหมาะกับ LINE ที่ต้องการ HTTPS public GET)
-    """
-    if not EE_THUMB_PATTERN.match(url):
-        raise HTTPException(status_code=400, detail="Invalid EE thumbnail URL")
+from fastapi import Query
+from fastapi.responses import StreamingResponse
+import requests
 
+@app.get("/map_png_proxy")
+def map_png_proxy(
+    station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
+    year: int = Query(..., ge=2017, le=2025),
+    layer: Literal["chl_a", "secchi", "tsi"] = "chl_a",
+    cloud_perc: int = 30,
+    ac: Literal["none","full"] = "none",
+    width: int = 1024, height: int = 1024
+):
+    """สร้างภาพ (เหมือน /map_png) แล้วสตรีม PNG กลับทันที"""
+    if station not in AOIS:
+        raise HTTPException(404, "Unknown station")
+
+    geom = AOIS[station]; ini, end = get_window(year)
+    mask = build_water_mask(geom)
+    cols = build_collections(geom, ini, end, cloud_perc, mask, ac)
+    base_for_chl_sd = cols["toa_rrs"] if ac=="full" else cols["sr_scaled"]
+
+    if layer == "chl_a":
+        img = base_for_chl_sd.map(img_chl).mean().clip(geom)
+        vis = {"min":0,"max":40,"palette":['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
+    elif layer == "secchi":
+        img = base_for_chl_sd.map(img_zsd).mean().clip(geom)
+        vis = {"min":0,"max":2,"palette":['800000','FF9700','7BFF7B','0080FF','000080']}
+    else:
+        img = base_for_chl_sd.map(img_chl).map(img_tsi_from_chl).mean().clip(geom)
+        vis = {"min":30,"max":80,"palette":['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
+
+    # สร้างลิงก์ชั่วคราว แล้วดึงภาพทันที
+    png_url = img.visualize(**vis).getThumbURL({
+        "dimensions": f"{width}x{height}",
+        "region": geom,
+        "format": "png"
+    })
     try:
-        r = requests.post(
-            url,
-            timeout=60,
-            headers={"User-Agent": "AquaSight-Proxy/1.0"},
-        )
+        r = requests.get(png_url, stream=True, timeout=30, headers={"User-Agent":"AquaSight-Proxy/1.0"})
         r.raise_for_status()
-
-        data = r.content
-        return Response(
-            content=data,
-            media_type="image/png",
-            headers={
-                "Cache-Control": "public, max-age=300",
-                "Content-Length": str(len(data)),
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
+        return StreamingResponse(r.raw, media_type="image/png",
+                                 headers={"Cache-Control":"public, max-age=300"})
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Proxy fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Fetch PNG failed: {e}")
 
 
 if __name__ == "__main__":
