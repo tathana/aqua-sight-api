@@ -649,9 +649,10 @@ def map_png_proxy(
     layer: Literal["chl_a", "secchi", "tsi"] = "chl_a",
     cloud_perc: int = 30,
     ac: Literal["none","full"] = "none",
-    width: int = 1024, height: int = 1024
+    # ขออนุญาตตั้งค่าดีฟอลต์ให้เบาลง
+    width: int = 640, height: int = 640,
+    scale: int = 60,          # เมตร/พิกเซล (60–120 ช่วยลด memory)
 ):
-    """สร้างภาพจาก Earth Engine โดยตรง (ไม่ใช้ getThumbURL)"""
     if station not in AOIS:
         raise HTTPException(404, "Unknown station")
 
@@ -661,7 +662,6 @@ def map_png_proxy(
     cols = build_collections(geom, ini, end, cloud_perc, mask, ac)
     base_for_chl_sd = cols["toa_rrs"] if ac == "full" else cols["sr_scaled"]
 
-    # --- สร้างภาพตาม layer ---
     if layer == "chl_a":
         img = base_for_chl_sd.map(img_chl).mean().clip(geom)
         vis = {"min": 0, "max": 40, "palette": ['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
@@ -672,17 +672,24 @@ def map_png_proxy(
         img = base_for_chl_sd.map(img_chl).map(img_tsi_from_chl).mean().clip(geom)
         vis = {"min": 30, "max": 80, "palette": ['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
 
-    # --- สร้างภาพโดยตรงจาก EE (ไม่ต้องผ่าน URL) ---
+    # 1) ลดความซับซ้อนของขอบเขต: ใช้ bounds() + buffer เล็กน้อย
+    #    (เพื่อให้ region เป็น bbox ธรรมดา, vertex น้อยลงมาก)
+    region_bbox = geom.buffer(50).bounds(1)
+
+    # 2) เตรียมภาพ visualization + resample
+    vis_img = img.visualize(**vis).resample('bilinear')
+
+    # 3) ส่งให้ EE เรนเดอร์แบบเบา: ระบุ scale และใช้ dimensions เป็นด้านเดียว
+    #    (ให้ EE เลือกอีกด้านตามสัดส่วนเอง)
     try:
-        png_bytes = ee.data.getThumbnail(
-            {
-                "image": img.visualize(**vis),
-                "dimensions": f"{width}x{height}",
-                "region": geom.toGeoJSONString(),
-                "format": "png",
-            },
-            30000  # timeout 30 วินาที
-        )
+        params = {
+            "image": vis_img,
+            "region": region_bbox.toGeoJSONString(),
+            "format": "png",
+            "scale": scale,
+            "dimensions": str(min(width, height)),  # ใส่ด้านเดียว เช่น "640"
+        }
+        png_bytes = ee.data.getThumbnail(params, 60000)  # timeout 60s
         if not png_bytes:
             raise HTTPException(500, "Empty PNG from Earth Engine")
 
