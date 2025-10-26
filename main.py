@@ -651,7 +651,7 @@ def map_png_proxy(
     ac: Literal["none","full"] = "none",
     width: int = 1024, height: int = 1024
 ):
-    """สร้างภาพ (เหมือน /map_png) แล้วสตรีม PNG กลับทันที"""
+    """สร้างภาพ (เหมือน /map_png) แล้วสตรีม PNG กลับทันที (ใช้ POST ไปยัง :getPixels)"""
     if station not in AOIS:
         raise HTTPException(404, "Unknown station")
 
@@ -670,20 +670,43 @@ def map_png_proxy(
         img = base_for_chl_sd.map(img_chl).map(img_tsi_from_chl).mean().clip(geom)
         vis = {"min":30,"max":80,"palette":['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
 
-    # สร้างลิงก์ชั่วคราว แล้วดึงภาพทันที
     png_url = img.visualize(**vis).getThumbURL({
         "dimensions": f"{width}x{height}",
         "region": geom,
-        "format": "png"
+        "format": "png",
     })
-    try:
-        r = requests.get(png_url, stream=True, timeout=30, headers={"User-Agent":"AquaSight-Proxy/1.0"})
-        r.raise_for_status()
-        return StreamingResponse(r.raw, media_type="image/png",
-                                 headers={"Cache-Control":"public, max-age=300"})
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Fetch PNG failed: {e}")
 
+    try:
+        # EE thumbnails ต้อง POST
+        r = requests.post(
+            png_url,
+            stream=True,
+            timeout=30,
+            headers={"User-Agent": "AquaSight-Proxy/1.0"}
+        )
+        r.raise_for_status()
+        return StreamingResponse(
+            r.raw,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=300"}
+        )
+    except requests.RequestException as e:
+        # สำรอง: บางสภาพแวดล้อม GET อาจใช้ได้ ลองอีกครั้งแบบ GET
+        try:
+            rg = requests.get(
+                png_url,
+                stream=True,
+                timeout=30,
+                headers={"User-Agent": "AquaSight-Proxy/1.0"}
+            )
+            rg.raise_for_status()
+            return StreamingResponse(
+                rg.raw,
+                media_type="image/png",
+                headers={"Cache-Control": "public, max-age=300"}
+            )
+        except requests.RequestException:
+            raise HTTPException(status_code=502, detail=f"Fetch PNG failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn
