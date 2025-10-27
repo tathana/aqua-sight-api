@@ -649,9 +649,8 @@ def map_png_proxy(
     layer: Literal["chl_a", "secchi", "tsi"] = "chl_a",
     cloud_perc: int = 30,
     ac: Literal["none","full"] = "none",
-    # ค่า default ให้เบาลงสำหรับ LINE
     width: int = 640, height: int = 640,
-    scale: int = 60,  # เมตร/พิกเซล (60–120 ช่วยลด memory)
+    scale: int = 60,  # ใส่ >0 เพื่อใช้โหมด scale; ถ้าอยากล็อกพิกเซล ให้ส่ง scale=0 หรือไม่ส่งค่า
 ):
     if station not in AOIS:
         raise HTTPException(404, "Unknown station")
@@ -672,30 +671,28 @@ def map_png_proxy(
         img = base_for_chl_sd.map(img_chl).map(img_tsi_from_chl).mean().clip(geom)
         vis = {"min": 30, "max": 80, "palette": ['darkblue','blue','cyan','limegreen','yellow','orange','orangered','darkred']}
 
-    # 1) ทำ region ให้เรียบเป็น bbox แล้วแปลงเป็น GeoJSON string จริง
+    # ทำ region ให้เรียบเป็น bbox แล้วแปลงเป็น GeoJSON string
     region_bbox = geom.buffer(50).bounds(1)
-    region_geojson_str = json.dumps(region_bbox.getInfo())  # <-- แก้จาก .toGeoJSONString()
+    region_geojson = json.dumps(region_bbox.getInfo())
 
-    # 2) เตรียมภาพ visualization + resample
+    # เตรียมภาพ visualization
     vis_img = img.visualize(**vis).resample('bilinear')
 
     try:
-        params = {
-            "image": vis_img,
-            "region": region_geojson_str,                 # <-- ใช้สตริง GeoJSON
-            "format": "png",
-            "scale": scale,
-            "dimensions": str(min(width, height)),        # ใส่ด้านเดียวพอ
-        }
-        png_bytes = ee.data.getThumbnail(params, 60000)   # timeout 60s
+        params = {"image": vis_img, "region": region_geojson, "format": "png"}
+
+        # เลือกอย่างใดอย่างหนึ่ง: scale หรือ dimensions
+        if scale and int(scale) > 0:
+            params["scale"] = int(scale)
+        else:
+            params["dimensions"] = str(min(width, height))
+
+        png_bytes = ee.data.getThumbnail(params, 60000)
         if not png_bytes:
             raise HTTPException(500, "Empty PNG from Earth Engine")
 
-        return Response(
-            content=png_bytes,
-            media_type="image/png",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        return Response(content=png_bytes, media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=300"})
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"การดึงข้อมูล PNG ล้มเหลว: {e}")
 
