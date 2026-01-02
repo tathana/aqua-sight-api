@@ -1,6 +1,6 @@
 # =========================================================
-# Aqua Sight API — Production Safe
-# Logic aligned with GEE UI (Code B)
+# Aqua Sight API — Production Safe (Render-ready)
+# Logic aligned to GEE UI (Code B)
 # =========================================================
 
 import os, json, base64, tempfile, re
@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
+import requests
 
 # =========================================================
 # 0) Earth Engine Init (Render-safe)
@@ -38,14 +39,16 @@ try:
     else:
         raise RuntimeError("Missing Earth Engine credentials")
 except Exception as e:
-    raise RuntimeError(f"EE init failed: {e}")
+    raise RuntimeError(f"Earth Engine init failed: {e}")
 
+# =========================================================
+# App
+# =========================================================
 app = FastAPI(title="Aqua Sight API", version="1.2.0")
 
-# =========================================================
-# CORS
-# =========================================================
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGIN", "*").split(",")]
+allowed = os.getenv("ALLOWED_ORIGIN", "*")
+origins = [o.strip() for o in allowed.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -85,9 +88,9 @@ YEARS = list(range(2017, 2026))
 SCALE = 20
 MAXPX = 1e13
 
-def get_window(year):
+def get_window(year:int):
     ini = ee.Date.fromYMD(year,1,1)
-    end = ini.advance(12,'month')
+    end = ini.advance(12,"month")
     return ini, end
 
 def build_water_mask(geom):
@@ -96,24 +99,26 @@ def build_water_mask(geom):
         opt = img.select('SR_B.*').multiply(0.0000275).add(-0.2)
         return img.addBands(opt, None, True)
     SRP = SRP.map(scale)
-    m = (SRP.filterBounds(geom)
-            .select('SR_B6')
-            .filter(ee.Filter.lt('CLOUD_COVER',30))
-            .filter(ee.Filter.calendarRange(1,1,'month'))
-            .filter(ee.Filter.calendarRange(2021,2025,'year'))
-            .median()
-            .lt(300))
+    m = SRP.filterBounds(geom)\
+           .select('SR_B6')\
+           .filter(ee.Filter.lt('CLOUD_COVER',30))\
+           .filter(ee.Filter.calendarRange(1,1,'month'))\
+           .filter(ee.Filter.calendarRange(2021,2025,'year'))\
+           .median()\
+           .lt(300)
     return m.updateMask(m)
 
 def s2_sr(geom, ini, end, cloud):
     return ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
-        .filterBounds(geom).filterDate(ini,end)\
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud))
+             .filterBounds(geom)\
+             .filterDate(ini,end)\
+             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud))
 
 def s2_toa(geom, ini, end, cloud):
     return ee.ImageCollection("COPERNICUS/S2_HARMONIZED")\
-        .filterBounds(geom).filterDate(ini,end)\
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud))
+             .filterBounds(geom)\
+             .filterDate(ini,end)\
+             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud))
 
 def add_scaled(img, mask):
     bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12']
@@ -121,95 +126,83 @@ def add_scaled(img, mask):
               .copyProperties(img, ['system:time_start'])
 
 # =========================================================
-# 3) Water Quality Functions (MASKED like Code B)
+# 3) Water Quality (MATCH Code B)
 # =========================================================
 def img_pH(img):
-    ph = ee.Image(8.339).subtract(
-        ee.Image(0.827).multiply(img.select('B1').divide(img.select('B8')))
-    )
-    return ph.updateMask(ph.lt(14)).rename('pH')\
-             .copyProperties(img, ['system:time_start'])
+    ph = ee.Image(8.339).subtract(ee.Image(0.827).multiply(img.select('B1').divide(img.select('B8'))))
+    return ph.updateMask(ph.lt(14)).rename('pH').copyProperties(img, ['system:time_start'])
 
 def img_turb(img):
     ndvi = img.normalizedDifference(['B8','B4'])
     tur = ee.Image(100).multiply(ee.Image(1).subtract(ndvi))
-    return tur.updateMask(tur.lt(100)).rename('turbidity')\
-              .copyProperties(img, ['system:time_start'])
+    return tur.updateMask(tur.lt(100)).rename('turbidity').copyProperties(img, ['system:time_start'])
 
 def img_sal(img):
     sal = img.normalizedDifference(['B11','B12'])
-    return sal.updateMask(sal.abs().lt(1)).rename('salinity_idx')\
-              .copyProperties(img, ['system:time_start'])
+    return sal.updateMask(sal.abs().lt(1)).rename('salinity_idx').copyProperties(img, ['system:time_start'])
 
 def img_do(img):
     do = (ee.Image(-0.0167).multiply(img.select('B8'))
           .add(ee.Image(0.0067).multiply(img.select('B9')))
           .add(ee.Image(0.0083).multiply(img.select('B11')))
           .add(9.577))
-    return do.updateMask(do.lt(20)).rename('do_mgL')\
-             .copyProperties(img, ['system:time_start'])
+    return do.updateMask(do.lt(20)).rename('do_mgL').copyProperties(img, ['system:time_start'])
 
 def img_chl(img):
     ndci = img.normalizedDifference(['B5','B4'])
-    chl = (ee.Image(14.039)
-           .add(ee.Image(86.115).multiply(ndci))
-           .add(ee.Image(194.325).multiply(ndci.pow(2))))
-    return chl.updateMask(chl.lt(100)).rename('chl_a')\
-              .copyProperties(img, ['system:time_start'])
+    chl = ee.Image(14.039)\
+          .add(ee.Image(86.115).multiply(ndci))\
+          .add(ee.Image(194.325).multiply(ndci.pow(2)))
+    return chl.updateMask(chl.lt(100)).rename('chl_a').copyProperties(img, ['system:time_start'])
 
 def img_zsd(img):
     blueRed = img.select('B2').divide(img.select('B4')).log()
     lnMOSD = ee.Image(1.4856).multiply(blueRed).add(0.2734)
     zsd = ee.Image(0.1777).multiply(ee.Image(10).pow(lnMOSD)).add(1.0813)
-    return zsd.updateMask(zsd.lt(10)).rename('secchi_m')\
-              .copyProperties(img, ['system:time_start'])
+    return zsd.updateMask(zsd.lt(10)).rename('secchi_m').copyProperties(img, ['system:time_start'])
 
 def img_tsi_from_chl(chl):
     tsi = ee.Image(30.6).add(ee.Image(9.81).multiply(chl.log()))
-    return tsi.updateMask(tsi.lt(200)).rename('tsi')\
-              .copyProperties(chl, ['system:time_start'])
+    return tsi.updateMask(tsi.lt(200)).rename('tsi').copyProperties(chl, ['system:time_start'])
 
 def tsi_reclass(tsi):
     img = tsi
-    return (img.where(img.lt(30),1)
-              .where(img.gte(30).And(img.lt(40)),2)
-              .where(img.gte(40).And(img.lt(50)),3)
-              .where(img.gte(50).And(img.lt(60)),4)
-              .where(img.gte(60).And(img.lt(70)),5)
-              .where(img.gte(70).And(img.lt(80)),6)
-              .where(img.gte(80),7)
-              .rename('tsi_class')
-              .copyProperties(tsi, ['system:time_start']))
+    return img.where(img.lt(30),1)\
+              .where(img.gte(30).And(img.lt(40)),2)\
+              .where(img.gte(40).And(img.lt(50)),3)\
+              .where(img.gte(50).And(img.lt(60)),4)\
+              .where(img.gte(60).And(img.lt(70)),5)\
+              .where(img.gte(70).And(img.lt(80)),6)\
+              .where(img.gte(80),7)\
+              .rename('tsi_class')\
+              .copyProperties(tsi,['system:time_start'])
 
 # =========================================================
-# 4) Monthly (Scene-based like GEE UI)
+# 4) Scene-based Monthly (MATCH GEE UI)
 # =========================================================
 def monthly_series(ic, geom, band, year):
     out = []
     for m in range(1,13):
         start = ee.Date.fromYMD(year,m,1)
-        end = start.advance(1,'month')
+        end   = start.advance(1,"month")
         month_ic = ic.filterDate(start,end)
 
-        def per(img):
+        def per_img(img):
             r = ee.Reducer.mode() if band=='tsi_class' else ee.Reducer.mean()
-            v = img.select(band).reduceRegion(
-                r, geom, SCALE, maxPixels=MAXPX
-            ).get(band)
-            return ee.Feature(None, {'v':v})
+            v = img.select(band).reduceRegion(r, geom, SCALE, maxPixels=MAXPX).get(band)
+            return ee.Feature(None, {"v": v})
 
-        fc = ee.FeatureCollection(month_ic.map(per))
+        fc = ee.FeatureCollection(month_ic.map(per_img))
         reducer = ee.Reducer.mode() if band=='tsi_class' else ee.Reducer.mean()
-        val = fc.reduceColumns(reducer,['v']).get(
-            'mode' if band=='tsi_class' else 'mean'
-        )
+        key = 'mode' if band=='tsi_class' else 'mean'
+        val = fc.reduceColumns(reducer, ['v']).get(key)
 
         try:
             vpy = float(ee.Number(val).getInfo()) if val else None
         except:
             vpy = None
 
-        out.append({'month':m,'value':vpy})
+        out.append({"month": m, "value": vpy})
     return out
 
 # =========================================================
@@ -217,13 +210,93 @@ def monthly_series(ic, geom, band, year):
 # =========================================================
 @app.get("/stations")
 def stations():
-    return [{"code":k,"name":STATIONS_META[k]} for k in AOIS]
+    return [{"code": k, "name": STATIONS_META[k]} for k in AOIS]
 
 @app.get("/years")
 def years():
     return YEARS
 
-# ===== timeseries_monthly, scenes, summary_year, map_png, tiles =====
-# ใช้ของเดิมทั้งหมด (logic ข้างใน auto ใกล้ Code B แล้ว)
-# 👉 ตรงนี้คุณสามารถใช้จากไฟล์เดิมได้ “ทั้งดุ้น”
-# 👉 ไม่เปลี่ยน signature / URL ใด ๆ
+@app.get("/timeseries_monthly")
+def timeseries_monthly(
+    station: str,
+    year: int,
+    cloud_perc: int = 30,
+    ac: Literal["none","full"] = "none"
+):
+    geom = AOIS[station]
+    ini,end = get_window(year)
+    mask = build_water_mask(geom)
+
+    sr = s2_sr(geom,ini,end,cloud_perc).map(lambda i: add_scaled(i,mask))
+    toa = s2_toa(geom,ini,end,cloud_perc).map(lambda i: add_scaled(i,mask))
+
+    base_chl = toa if ac=="full" else sr
+    base_phy = sr
+
+    ph  = base_phy.map(img_pH)
+    tur = base_phy.map(img_turb)
+    sal = base_phy.map(img_sal)
+    dox = base_phy.map(img_do)
+    chl = base_chl.map(img_chl)
+    zsd = base_chl.map(img_zsd)
+    tsi = chl.map(img_tsi_from_chl)
+    tsi_cls = tsi.map(tsi_reclass)
+
+    return {
+        "station":station,"year":year,"cloud_perc":cloud_perc,"ac":ac,
+        "monthly":{
+            "pH":monthly_series(ph,geom,"pH",year),
+            "turbidity":monthly_series(tur,geom,"turbidity",year),
+            "salinity_idx":monthly_series(sal,geom,"salinity_idx",year),
+            "do_mgL":monthly_series(dox,geom,"do_mgL",year),
+            "chl_a":monthly_series(chl,geom,"chl_a",year),
+            "secchi_m":monthly_series(zsd,geom,"secchi_m",year),
+            "tsi":monthly_series(tsi,geom,"tsi",year),
+            "tsi_class":monthly_series(tsi_cls,geom,"tsi_class",year)
+        }
+    }
+
+@app.get("/summary_year")
+def summary_year(
+    station: str,
+    year: int,
+    cloud_perc: int = 30,
+    ac: Literal["none","full"] = "none"
+):
+    geom = AOIS[station]
+    ini,end = get_window(year)
+    mask = build_water_mask(geom)
+
+    sr = s2_sr(geom,ini,end,cloud_perc).map(lambda i: add_scaled(i,mask))
+    toa = s2_toa(geom,ini,end,cloud_perc).map(lambda i: add_scaled(i,mask))
+
+    base_chl = toa if ac=="full" else sr
+    base_phy = sr
+
+    def mean(ic, band):
+        try:
+            return float(ic.mean().reduceRegion(
+                ee.Reducer.mean(), geom, SCALE, maxPixels=MAXPX
+            ).get(band).getInfo())
+        except:
+            return None
+
+    chl = base_chl.map(img_chl)
+    tsi = chl.map(img_tsi_from_chl)
+
+    return {
+        "station":station,"year":year,"cloud_perc":cloud_perc,"ac":ac,
+        "mean":{
+            "pH":mean(base_phy.map(img_pH),'pH'),
+            "turbidity":mean(base_phy.map(img_turb),'turbidity'),
+            "salinity_idx":mean(base_phy.map(img_sal),'salinity_idx'),
+            "do_mgL":mean(base_phy.map(img_do),'do_mgL'),
+            "chl_a":mean(chl,'chl_a'),
+            "secchi_m":mean(base_chl.map(img_zsd),'secchi_m'),
+            "tsi":mean(tsi,'tsi')
+        }
+    }
+
+@app.get("/")
+def root():
+    return {"name":"Aqua Sight API"}
