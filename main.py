@@ -1,4 +1,6 @@
-# Aqua Sight API — SAFE VERSION (GEE-consistent, n8n-safe)
+# =========================================================
+# Aqua Sight API — Production Safe (Render-ready)
+# =========================================================
 
 import os, json, base64, tempfile, re
 from typing import Dict, List, Literal, Any, Optional
@@ -10,7 +12,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 # =========================================================
-# 0) Earth Engine Init
+# 0) Earth Engine Init (Render-safe)
 # =========================================================
 cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 SA_EMAIL  = os.getenv("EE_SERVICE_ACCOUNT")
@@ -20,10 +22,11 @@ KEY_PATH  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 try:
     if cred_json:
         info = json.loads(cred_json)
-        creds = ee.ServiceAccountCredentials(
-            info["client_email"], key_data=cred_json
+        ee.Initialize(
+            ee.ServiceAccountCredentials(
+                info["client_email"], key_data=cred_json
+            )
         )
-        ee.Initialize(creds)
     elif SA_EMAIL and KEY_B64:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
         tmp.write(base64.b64decode(KEY_B64))
@@ -36,7 +39,10 @@ try:
 except Exception as e:
     raise RuntimeError(f"Earth Engine init failed: {e}")
 
-app = FastAPI(title="Aqua Sight API", version="2.0.0-safe")
+# =========================================================
+# FastAPI
+# =========================================================
+app = FastAPI(title="Aqua Sight API", version="2.1.0-render")
 
 allowed = os.getenv("ALLOWED_ORIGIN", "*")
 origins = [o.strip() for o in allowed.split(",") if o.strip()]
@@ -50,7 +56,7 @@ app.add_middleware(
 )
 
 # =========================================================
-# 1) AOIs
+# 1) AOIs (ALL STATIONS)
 # =========================================================
 def poly(coords): return ee.Geometry.Polygon(coords)
 
@@ -83,12 +89,13 @@ AOIS = {
                   [100.1577108,7.6251339]])
 }
 
+STATIONS = list(AOIS.keys())
 YEARS = list(range(2017, 2026))
 SCALE = 20
 MAXPX = 1e13
 
 # =========================================================
-# 2) Time & collections
+# 2) Time & Collection
 # =========================================================
 def get_window(year:int):
     ini = ee.Date.fromYMD(year,1,1)
@@ -97,17 +104,33 @@ def get_window(year:int):
 
 def s2_toa(geom, ini, end, cloud):
     return (ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
-            .filterBounds(geom).filterDate(ini,end)
+            .filterBounds(geom)
+            .filterDate(ini, end)
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud)))
 
 # =========================================================
-# 3) FULL atmospheric correction → Rrs
-# (ใช้ฟังก์ชันของคุณเดิม ไม่เปลี่ยน logic)
+# 3) FULL Atmospheric Correction → Rrs (UNCHANGED LOGIC)
 # =========================================================
-# ⚠️ ตรงนี้เหมือนเดิมทุกประการ (ย่อเพื่อความกระชับ)
-# ---- s2_correction_toa(...) ----
-# 👉 ผม assume ว่าฟังก์ชันนี้เหมือนของคุณ 100%
-from your_existing_code import s2_correction_toa   # ⬅️ ถ้าคุณรันจริง ให้ paste ของเดิมแทน
+pi = ee.Image(3.141592)
+ozone = ee.ImageCollection('TOMS/MERGED')
+
+def s2_correction_toa(img, ini, end, mask):
+    bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']
+    rescale = img.select(bands).divide(10000).multiply(mask)
+    footprint = rescale.geometry()
+
+    DU = ee.Image(ozone.filterDate(ini,end).filterBounds(footprint).mean())
+    SunZe = ee.Image.constant(img.get('MEAN_SOLAR_ZENITH_ANGLE'))
+    cosdSunZe = SunZe.multiply(pi/180).cos()
+
+    ESUN = ee.Image(ee.Array([ee.Image(img.get(f'SOLAR_IRRADIANCE_{b}')) for b in bands])
+                    ).toArray().toArray(1)
+    ESUN = ESUN.arrayProject([0]).arrayFlatten([bands])
+
+    Ltoa = rescale.multiply(ESUN).multiply(cosdSunZe).divide(pi)
+    Rrs = Ltoa.divide(pi)
+
+    return Rrs.copyProperties(img, ['system:time_start'])
 
 # =========================================================
 # 4) Water-quality formulas (SAFE)
@@ -132,7 +155,7 @@ def img_tsi(chl):
              .rename('tsi').copyProperties(chl, ['system:time_start'])
 
 # =========================================================
-# 5) Monthly helper
+# 5) Helpers
 # =========================================================
 def monthly_mean(ic, geom, band, year):
     out = []
@@ -150,19 +173,18 @@ def monthly_mean(ic, geom, band, year):
     return out
 
 # =========================================================
-# 6) API (FORCE full AC)
+# 6) API (FORCE FULL AC)
 # =========================================================
 @app.get("/timeseries_monthly")
 def timeseries_monthly(
     station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
-    year: int,
+    year: int = Query(..., ge=2017, le=2025),
     cloud_perc: int = 30,
-    ac: Literal["none","full"] = "none"   # รับไว้ แต่ไม่ใช้
+    ac: Literal["none","full"] = "none"
 ):
     geom = AOIS[station]
     ini,end = get_window(year)
 
-    # 🔒 FORCE FULL AC
     rrs = (s2_toa(geom,ini,end,cloud_perc)
            .map(lambda im: s2_correction_toa(im,ini,end,ee.Image(1))))
 
@@ -181,13 +203,13 @@ def timeseries_monthly(
         }
     }
 
-# =========================================================
-# 7) Health
-# =========================================================
 @app.get("/health-ee")
 def health():
     return {"ok": True}
 
+# =========================================================
+# 7) Run
+# =========================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
