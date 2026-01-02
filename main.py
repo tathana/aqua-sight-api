@@ -1,15 +1,13 @@
 # =========================================================
-# Aqua Sight API — Production Safe (Render-ready)
+# Aqua Sight API — FINAL (Render-ready, Sentinel-2 SAFE)
 # =========================================================
 
-import os, json, base64, tempfile, re
-from typing import Dict, List, Literal, Any, Optional
+import os, json, base64, tempfile
+from typing import Literal
 
 import ee
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from pydantic import BaseModel
 
 # =========================================================
 # 0) Earth Engine Init (Render-safe)
@@ -42,7 +40,7 @@ except Exception as e:
 # =========================================================
 # FastAPI
 # =========================================================
-app = FastAPI(title="Aqua Sight API", version="2.1.0-render")
+app = FastAPI(title="Aqua Sight API", version="2.2.0-final")
 
 allowed = os.getenv("ALLOWED_ORIGIN", "*")
 origins = [o.strip() for o in allowed.split(",") if o.strip()]
@@ -58,7 +56,8 @@ app.add_middleware(
 # =========================================================
 # 1) AOIs (ALL STATIONS)
 # =========================================================
-def poly(coords): return ee.Geometry.Polygon(coords)
+def poly(coords):
+    return ee.Geometry.Polygon(coords)
 
 AOIS = {
     "CP01": poly([[99.2468656,10.4457916],[99.2474450,10.4457072],[99.2473592,10.4423730],
@@ -89,13 +88,11 @@ AOIS = {
                   [100.1577108,7.6251339]])
 }
 
-STATIONS = list(AOIS.keys())
-YEARS = list(range(2017, 2026))
 SCALE = 20
 MAXPX = 1e13
 
 # =========================================================
-# 2) Time & Collection
+# 2) Time & Sentinel-2 Collection
 # =========================================================
 def get_window(year:int):
     ini = ee.Date.fromYMD(year,1,1)
@@ -109,31 +106,31 @@ def s2_toa(geom, ini, end, cloud):
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud)))
 
 # =========================================================
-# 3) FULL Atmospheric Correction → Rrs (UNCHANGED LOGIC)
+# 3) FULL Atmospheric Correction (SAFE ESUN)
 # =========================================================
-pi = ee.Image(3.141592)
-ozone = ee.ImageCollection('TOMS/MERGED')
+PI = ee.Image.constant(3.141592)
 
 def s2_correction_toa(img, ini, end, mask):
     bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']
+
+    # Sentinel-2 ESUN (ESA standard)
+    ESUN = ee.Image.constant([
+        1913.57, 1941.63, 1822.61, 1512.79, 1425.56,
+        1288.32, 1163.19, 1036.39, 955.19, 367.15, 245.59
+    ])
+
     rescale = img.select(bands).divide(10000).multiply(mask)
-    footprint = rescale.geometry()
 
-    DU = ee.Image(ozone.filterDate(ini,end).filterBounds(footprint).mean())
     SunZe = ee.Image.constant(img.get('MEAN_SOLAR_ZENITH_ANGLE'))
-    cosdSunZe = SunZe.multiply(pi/180).cos()
+    cosSun = SunZe.multiply(PI.divide(180)).cos()
 
-    ESUN = ee.Image(ee.Array([ee.Image(img.get(f'SOLAR_IRRADIANCE_{b}')) for b in bands])
-                    ).toArray().toArray(1)
-    ESUN = ESUN.arrayProject([0]).arrayFlatten([bands])
+    Ltoa = rescale.multiply(ESUN).multiply(cosSun).divide(PI)
+    Rrs = Ltoa.divide(PI)
 
-    Ltoa = rescale.multiply(ESUN).multiply(cosdSunZe).divide(pi)
-    Rrs = Ltoa.divide(pi)
-
-    return Rrs.copyProperties(img, ['system:time_start'])
+    return Rrs.rename(bands).copyProperties(img, ['system:time_start'])
 
 # =========================================================
-# 4) Water-quality formulas (SAFE)
+# 4) Water-quality formulas
 # =========================================================
 def img_chl(img):
     ndci = img.normalizedDifference(['B5','B4'])
@@ -147,7 +144,8 @@ def img_zsd(img):
     ratio = img.select('B2').divide(img.select('B4')).clamp(0.01, 10)
     lnMOSD = ee.Image(1.4856).multiply(ratio.log()).add(0.2734)
     zsd = ee.Image(0.1777).multiply(ee.Image(10).pow(lnMOSD)).add(1.0813)
-    return zsd.updateMask(zsd.lt(10)).rename('secchi_m') \
+    return zsd.updateMask(zsd.lt(10)) \
+              .rename('secchi_m') \
               .copyProperties(img, ['system:time_start'])
 
 def img_tsi(chl):
@@ -169,19 +167,35 @@ def monthly_mean(ic, geom, band, year):
             v = float(ee.Number(v).getInfo())
         except:
             v = None
-        out.append({"month":m,"value":v})
+        out.append({"month": m, "value": v})
     return out
 
 # =========================================================
-# 6) API (FORCE FULL AC)
+# 6) API Endpoints
 # =========================================================
+@app.get("/")
+def root():
+    return {
+        "name": "Aqua Sight API",
+        "endpoints": [
+            "/health-ee",
+            "/timeseries_monthly"
+        ]
+    }
+
+@app.get("/health-ee")
+def health():
+    return {"ok": True}
+
 @app.get("/timeseries_monthly")
 def timeseries_monthly(
     station: Literal["CP01","LS01","LS03","TP01","TP04","TP11","PN01","SK01","SK06"],
     year: int = Query(..., ge=2017, le=2025),
     cloud_perc: int = 30,
-    ac: Literal["none","full"] = "none"
 ):
+    if station not in AOIS:
+        raise HTTPException(404, "Unknown station")
+
     geom = AOIS[station]
     ini,end = get_window(year)
 
@@ -197,18 +211,14 @@ def timeseries_monthly(
         "year": year,
         "ac": "full",
         "monthly": {
-            "chl_a": monthly_mean(chl,geom,"chl_a",year),
-            "secchi_m": monthly_mean(zsd,geom,"secchi_m",year),
-            "tsi": monthly_mean(tsi,geom,"tsi",year)
+            "chl_a": monthly_mean(chl, geom, "chl_a", year),
+            "secchi_m": monthly_mean(zsd, geom, "secchi_m", year),
+            "tsi": monthly_mean(tsi, geom, "tsi", year)
         }
     }
 
-@app.get("/health-ee")
-def health():
-    return {"ok": True}
-
 # =========================================================
-# 7) Run
+# 7) Run (Local)
 # =========================================================
 if __name__ == "__main__":
     import uvicorn
